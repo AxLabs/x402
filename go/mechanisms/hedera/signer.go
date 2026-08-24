@@ -238,6 +238,10 @@ type privateKeyClientSigner struct {
 	cfg       *ClientConfig
 }
 
+// maxClientTransactionNodes keeps partially signed transactions small enough
+// for HTTP payment headers while retaining alternate-node submission fallback.
+const maxClientTransactionNodes = 3
+
 // NewPrivateKeyClientSigner builds a ClientHederaSigner from account id + private key.
 func NewPrivateKeyClientSigner(accountID, privateKey, network string, cfg ...*ClientConfig) (ClientHederaSigner, error) {
 	if err := AssertSupportedNetwork(network); err != nil {
@@ -311,6 +315,7 @@ func (c *privateKeyClientSigner) CreatePartiallySignedTransferTransaction(
 		return "", err
 	}
 	defer client.Close()
+	client.SetMaxNodesPerTransaction(maxClientTransactionNodes)
 
 	frozen, err := tx.FreezeWith(client)
 	if err != nil {
