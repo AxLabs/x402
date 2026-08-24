@@ -3,11 +3,14 @@ package client_test
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"testing"
 
+	sdkproto "github.com/hiero-ledger/hiero-sdk-go/v2/proto/sdk"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera/exact/client"
 	"github.com/x402-foundation/x402/go/v2/types"
+	"google.golang.org/protobuf/proto"
 )
 
 type fakeClientSigner struct {
@@ -96,5 +99,50 @@ func TestClientBuildRealPartialTransfer(t *testing.T) {
 	}
 	if inspected.TransactionIDAccount != "0.0.5001" {
 		t.Fatalf("fee payer account=%s", inspected.TransactionIDAccount)
+	}
+}
+
+func TestClientLimitsNodeVariantsAndPaymentHeaderSize(t *testing.T) {
+	// Deterministic ED25519 DER key (SDK test vector style).
+	const ed25519DER = "302e020100300506032b657004220420a869f4c6191b9c8c99933e7f6b6611711737e4b1a1a5a4cb5370e719a1f6df98"
+	signer, err := hedera.NewPrivateKeyClientSigner("0.0.9001", ed25519DER, hedera.HederaMainnetCAIP2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scheme := client.NewExactHederaScheme(signer)
+	req := types.PaymentRequirements{
+		Scheme:            hedera.SchemeExact,
+		Network:           hedera.HederaMainnetCAIP2,
+		Asset:             hedera.HederaMainnetUSDC,
+		Amount:            "100000",
+		PayTo:             "0.0.10787907",
+		MaxTimeoutSeconds: 300,
+		Extra:             map[string]interface{}{"feePayer": "0.0.10789914"},
+	}
+	payload, err := scheme.CreatePaymentPayload(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	txB64, _ := payload.Payload["transaction"].(string)
+	raw, err := base64.StdEncoding.DecodeString(txB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var txList sdkproto.TransactionList
+	if err := proto.Unmarshal(raw, &txList); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(txList.TransactionList); got != 3 {
+		t.Fatalf("node transaction variants=%d, want 3", got)
+	}
+
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := base64.StdEncoding.EncodeToString(payloadJSON)
+	if len(header) >= 4096 {
+		t.Fatalf("PAYMENT-SIGNATURE length=%d, want less than 4096", len(header))
 	}
 }
