@@ -109,7 +109,8 @@ func (f *ExactHederaScheme) Settle(
 ) (*x402.SettleResponse, error) {
 	verifyResp, err := f.Verify(ctx, payload, requirements, fctx)
 	if err != nil {
-		if ve, ok := err.(*x402.VerifyError); ok {
+		var ve *x402.VerifyError
+		if errors.As(err, &ve) {
 			return nil, x402.NewSettleError(ve.InvalidReason, ve.Payer, x402.Network(requirements.Network), "", ve.InvalidMessage)
 		}
 		return nil, x402.NewSettleError(ErrVerificationFailed, "", x402.Network(requirements.Network), "", err.Error())
@@ -120,7 +121,7 @@ func (f *ExactHederaScheme) Settle(
 
 	txID, err := f.settlePayment(ctx, payload, requirements)
 	if err != nil {
-		return nil, x402.NewSettleError(ErrTransactionFailed, verifyResp.Payer, x402.Network(requirements.Network), "", err.Error())
+		return nil, x402.NewSettleError(ErrTransactionFailed, verifyResp.Payer, x402.Network(requirements.Network), txID, err.Error())
 	}
 	return &x402.SettleResponse{
 		Success:     true,
@@ -157,7 +158,7 @@ func (f *ExactHederaScheme) verifyPayment(
 		return "", &verifyFailure{Reason: ErrInvalidAmount, Message: "invalid amount"}
 	}
 
-	feePayer, ok := extraString(requirements.Extra, "feePayer")
+	feePayer, ok := extraString(requirements.Extra)
 	if !ok || !hedera.IsValidEntityID(feePayer) {
 		return "", &verifyFailure{Reason: ErrMissingFeePayer, Message: "missing feePayer"}
 	}
@@ -283,9 +284,19 @@ func (f *ExactHederaScheme) settlePayment(
 		return "", fmt.Errorf("transaction already settled")
 	}
 
-	feePayer, _ := extraString(requirements.Extra, "feePayer")
+	feePayer, _ := extraString(requirements.Extra)
 	txID, err := f.signer.SignAndSubmitTransaction(ctx, txB64, feePayer, requirements.Network)
 	if err != nil {
+		var submitted *hedera.TransactionSubmittedError
+		if errors.As(err, &submitted) {
+			if f.settlementCache != nil {
+				f.settlementCache.Confirm(inspected.TransactionID)
+			}
+			if txID == "" {
+				txID = submitted.TransactionID
+			}
+			return txID, err
+		}
 		if f.settlementCache != nil {
 			f.settlementCache.Release(inspected.TransactionID)
 		}
@@ -304,19 +315,19 @@ func acceptedMatchesRequirements(accepted, requirements types.PaymentRequirement
 		accepted.MaxTimeoutSeconds != requirements.MaxTimeoutSeconds {
 		return &verifyFailure{Reason: ErrAcceptedMismatch, Message: "accepted payment requirements mismatch"}
 	}
-	acceptedFee, _ := extraString(accepted.Extra, "feePayer")
-	reqFee, _ := extraString(requirements.Extra, "feePayer")
+	acceptedFee, _ := extraString(accepted.Extra)
+	reqFee, _ := extraString(requirements.Extra)
 	if acceptedFee != reqFee {
 		return &verifyFailure{Reason: ErrAcceptedMismatch, Message: "accepted feePayer mismatch"}
 	}
 	return nil
 }
 
-func extraString(extra map[string]interface{}, key string) (string, bool) {
+func extraString(extra map[string]interface{}) (string, bool) {
 	if extra == nil {
 		return "", false
 	}
-	raw, ok := extra[key]
+	raw, ok := extra["feePayer"]
 	if !ok {
 		return "", false
 	}

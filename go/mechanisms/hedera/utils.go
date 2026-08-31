@@ -143,6 +143,9 @@ func inspectTransaction(transactionBase64 string) (InspectedTransaction, error) 
 	if err != nil {
 		return InspectedTransaction{}, fmt.Errorf("decode transaction: %w", err)
 	}
+	if _, err := decodeAndValidateTransactionVariants(raw); err != nil {
+		return InspectedTransaction{}, err
+	}
 	txIface, err := hiero.TransactionFromBytes(raw)
 	if err != nil {
 		return InspectedTransaction{}, fmt.Errorf("parse transaction: %w", err)
