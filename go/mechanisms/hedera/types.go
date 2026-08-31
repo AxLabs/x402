@@ -46,6 +46,26 @@ type AccountResolution struct {
 	IsAlias bool
 }
 
+// TransactionSubmittedError reports a failed or unknown outcome after node acceptance.
+type TransactionSubmittedError struct {
+	TransactionID string
+	Err           error
+}
+
+func (e *TransactionSubmittedError) Error() string {
+	if e == nil || e.Err == nil {
+		return "transaction submitted without a confirmed successful outcome"
+	}
+	return e.Err.Error()
+}
+
+func (e *TransactionSubmittedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
 // ClientHederaSigner creates partially signed transfer transactions.
 type ClientHederaSigner interface {
 	// AccountID returns the payer account id.

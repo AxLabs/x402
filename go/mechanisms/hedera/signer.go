@@ -3,6 +3,7 @@ package hedera
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 
 	hiero "github.com/hiero-ledger/hiero-sdk-go/v2/sdk"
@@ -95,10 +96,22 @@ func (s *PrivateKeyFacilitatorSigner) SignAndSubmitTransaction(
 		return "", fmt.Errorf("missing transaction id in payload")
 	}
 	if err := s.submitSignedTransfers(ctx, network, signed); err != nil {
+		var unknown *submissionOutcomeUnknownError
+		if errors.As(err, &unknown) {
+			txIDString := txID.String()
+			return txIDString, &TransactionSubmittedError{
+				TransactionID: txIDString,
+				Err:           err,
+			}
+		}
 		return "", err
 	}
 	if err := s.waitSuccess(ctx, network, *op, txID); err != nil {
-		return "", err
+		txIDString := txID.String()
+		return txIDString, &TransactionSubmittedError{
+			TransactionID: txIDString,
+			Err:           err,
+		}
 	}
 	return txID.String(), nil
 }

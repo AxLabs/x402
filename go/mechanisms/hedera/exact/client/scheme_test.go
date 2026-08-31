@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	sdkproto "github.com/hiero-ledger/hiero-sdk-go/v2/proto/sdk"
+	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera/exact/client"
 	"github.com/x402-foundation/x402/go/v2/types"
@@ -102,6 +103,42 @@ func TestClientBuildRealPartialTransfer(t *testing.T) {
 	}
 }
 
+func TestClientBuildRealPartialTokenTransfer(t *testing.T) {
+	const ed25519DER = "302e020100300506032b657004220420a869f4c6191b9c8c99933e7f6b6611711737e4b1a1a5a4cb5370e719a1f6df98"
+	signer, err := hedera.NewPrivateKeyClientSigner("0.0.9001", ed25519DER, hedera.HederaTestnetCAIP2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := types.PaymentRequirements{
+		Scheme:            hedera.SchemeExact,
+		Network:           hedera.HederaTestnetCAIP2,
+		Asset:             hedera.HederaTestnetUSDC,
+		Amount:            "50",
+		PayTo:             "0.0.7001",
+		MaxTimeoutSeconds: 180,
+		Extra:             map[string]interface{}{"feePayer": "0.0.5001"},
+	}
+	payload, err := client.NewExactHederaScheme(signer).CreatePaymentPayload(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	txB64, _ := payload.Payload["transaction"].(string)
+	inspected, err := hedera.InspectTransaction(txB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfers, err := hedera.AssetTransfers(inspected, req.Asset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(transfers) != 2 || hedera.SumTransfers(transfers).Sign() != 0 {
+		t.Fatalf("transfers=%+v", transfers)
+	}
+	if !hedera.HasNegativeTransfer(transfers, "0.0.9001") {
+		t.Fatalf("payer debit missing: %+v", transfers)
+	}
+}
+
 func TestClientLimitsNodeVariantsAndPaymentHeaderSize(t *testing.T) {
 	// Deterministic ED25519 DER key (SDK test vector style).
 	const ed25519DER = "302e020100300506032b657004220420a869f4c6191b9c8c99933e7f6b6611711737e4b1a1a5a4cb5370e719a1f6df98"
@@ -119,7 +156,18 @@ func TestClientLimitsNodeVariantsAndPaymentHeaderSize(t *testing.T) {
 		MaxTimeoutSeconds: 300,
 		Extra:             map[string]interface{}{"feePayer": "0.0.10789914"},
 	}
-	payload, err := scheme.CreatePaymentPayload(context.Background(), req)
+	xClient := x402.Newx402Client()
+	xClient.Register(x402.Network(hedera.HederaMainnetCAIP2), scheme)
+	payload, err := xClient.CreatePaymentPayload(
+		context.Background(),
+		req,
+		&types.ResourceInfo{
+			URL:         "https://example.com/premium",
+			Description: "Premium resource",
+			MimeType:    "application/json",
+		},
+		nil,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +181,7 @@ func TestClientLimitsNodeVariantsAndPaymentHeaderSize(t *testing.T) {
 	if err := proto.Unmarshal(raw, &txList); err != nil {
 		t.Fatal(err)
 	}
-	if got := len(txList.TransactionList); got != 3 {
+	if got := len(txList.GetTransactionList()); got != 3 {
 		t.Fatalf("node transaction variants=%d, want 3", got)
 	}
 

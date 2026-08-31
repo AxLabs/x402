@@ -19,6 +19,7 @@ type mirrorAccount struct {
 		Balance int64 `json:"balance"`
 	} `json:"balance"`
 	MaxAutomaticTokenAssociations int               `json:"max_automatic_token_associations"`
+	ReceiverSigRequired           bool              `json:"receiver_sig_required"`
 	Key                           *mirrorAccountKey `json:"key"`
 }
 
@@ -31,6 +32,21 @@ type mirrorTokenRelationship struct {
 	TokenID              string `json:"token_id"`
 	Balance              int64  `json:"balance"`
 	AutomaticAssociation bool   `json:"automatic_association"`
+	FreezeStatus         string `json:"freeze_status"`
+	KYCStatus            string `json:"kyc_status"`
+}
+
+type mirrorToken struct {
+	Type          string            `json:"type"`
+	Deleted       bool              `json:"deleted"`
+	PauseStatus   string            `json:"pause_status"`
+	FreezeDefault bool              `json:"freeze_default"`
+	KYCKey        *mirrorAccountKey `json:"kyc_key"`
+	CustomFees    struct {
+		FixedFees      []json.RawMessage `json:"fixed_fees"`
+		FractionalFees []json.RawMessage `json:"fractional_fees"`
+		RoyaltyFees    []json.RawMessage `json:"royalty_fees"`
+	} `json:"custom_fees"`
 }
 
 type mirrorTokensResponse struct {
@@ -63,7 +79,7 @@ func (m *mirrorHTTP) getJSON(ctx context.Context, url string, out interface{}) e
 		return err
 	}
 	if resp.StatusCode >= 300 {
-		return fmt.Errorf("Mirror Node request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
+		return fmt.Errorf("mirror node request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(data)))
 	}
 	if out != nil && len(data) > 0 {
 		return json.Unmarshal(data, out)
@@ -121,6 +137,17 @@ func preflightTransfer(
 		return SignatureCheck{Reason: "invalid_amount", Message: "invalid amount"}
 	}
 
+	var payToAccount mirrorAccount
+	if err := httpClient.getJSON(ctx, fmt.Sprintf("%s/api/v1/accounts/%s", mirrorBase, payTo), &payToAccount); err != nil {
+		return SignatureCheck{Reason: "preflight_failed", Message: err.Error()}
+	}
+	if payToAccount.ReceiverSigRequired {
+		return SignatureCheck{
+			Reason:  "receiver_signature_required",
+			Message: fmt.Sprintf("payTo %s requires a receiver signature", payTo),
+		}
+	}
+
 	if IsHbarAsset(asset) {
 		var account mirrorAccount
 		if err := httpClient.getJSON(ctx, fmt.Sprintf("%s/api/v1/accounts/%s", mirrorBase, payer), &account); err != nil {
@@ -136,6 +163,14 @@ func preflightTransfer(
 		return SignatureCheck{OK: true}
 	}
 
+	var token mirrorToken
+	if err := httpClient.getJSON(ctx, fmt.Sprintf("%s/api/v1/tokens/%s", mirrorBase, asset), &token); err != nil {
+		return SignatureCheck{Reason: "preflight_failed", Message: err.Error()}
+	}
+	if failure := tokenFailure(token, asset); failure != nil {
+		return *failure
+	}
+
 	var payerTokens mirrorTokensResponse
 	url := fmt.Sprintf("%s/api/v1/accounts/%s/tokens?token.id=%s", mirrorBase, payer, asset)
 	if err := httpClient.getJSON(ctx, url, &payerTokens); err != nil {
@@ -143,7 +178,11 @@ func preflightTransfer(
 	}
 	held := big.NewInt(0)
 	if len(payerTokens.Tokens) > 0 {
-		held = big.NewInt(payerTokens.Tokens[0].Balance)
+		payerToken := payerTokens.Tokens[0]
+		if failure := tokenRelationshipFailure(payerToken, "payer"); failure != nil {
+			return *failure
+		}
+		held = big.NewInt(payerToken.Balance)
 	}
 	if held.Cmp(required) < 0 {
 		return SignatureCheck{
@@ -152,7 +191,31 @@ func preflightTransfer(
 		}
 	}
 
-	associated, err := isPayToAssociated(ctx, httpClient, mirrorBase, payTo, asset)
+	var payToTokens mirrorTokensResponse
+	url = fmt.Sprintf("%s/api/v1/accounts/%s/tokens?token.id=%s", mirrorBase, payTo, asset)
+	if err := httpClient.getJSON(ctx, url, &payToTokens); err != nil {
+		return SignatureCheck{Reason: "preflight_failed", Message: err.Error()}
+	}
+	if len(payToTokens.Tokens) > 0 {
+		if failure := tokenRelationshipFailure(payToTokens.Tokens[0], "payTo"); failure != nil {
+			return *failure
+		}
+		return SignatureCheck{OK: true}
+	}
+	if token.FreezeDefault || token.KYCKey != nil {
+		return SignatureCheck{
+			Reason:  "pay_to_not_associated",
+			Message: fmt.Sprintf("payTo %s must be explicitly associated with %s", payTo, asset),
+		}
+	}
+
+	associated, err := hasAutomaticAssociationSlot(
+		ctx,
+		httpClient,
+		mirrorBase,
+		payTo,
+		payToAccount.MaxAutomaticTokenAssociations,
+	)
 	if err != nil {
 		return SignatureCheck{Reason: "preflight_failed", Message: err.Error()}
 	}
@@ -165,21 +228,49 @@ func preflightTransfer(
 	}
 }
 
-func isPayToAssociated(ctx context.Context, httpClient *mirrorHTTP, base, payTo, asset string) (bool, error) {
-	var direct mirrorTokensResponse
-	url := fmt.Sprintf("%s/api/v1/accounts/%s/tokens?token.id=%s", base, payTo, asset)
-	if err := httpClient.getJSON(ctx, url, &direct); err != nil {
-		return false, err
+func tokenFailure(token mirrorToken, asset string) *SignatureCheck {
+	if token.Type != "" && !strings.EqualFold(token.Type, "FUNGIBLE_COMMON") {
+		return &SignatureCheck{Reason: "invalid_asset", Message: fmt.Sprintf("%s is not a fungible token", asset)}
 	}
-	if len(direct.Tokens) > 0 {
-		return true, nil
+	if token.Deleted {
+		return &SignatureCheck{Reason: "invalid_asset", Message: fmt.Sprintf("%s is deleted", asset)}
 	}
+	if strings.EqualFold(token.PauseStatus, "PAUSED") {
+		return &SignatureCheck{Reason: "token_paused", Message: fmt.Sprintf("%s is paused", asset)}
+	}
+	if len(token.CustomFees.FixedFees) > 0 ||
+		len(token.CustomFees.FractionalFees) > 0 ||
+		len(token.CustomFees.RoyaltyFees) > 0 {
+		return &SignatureCheck{
+			Reason:  "token_custom_fees_unsupported",
+			Message: fmt.Sprintf("%s has custom fees that may debit the transaction fee payer", asset),
+		}
+	}
+	return nil
+}
 
-	var account mirrorAccount
-	if err := httpClient.getJSON(ctx, fmt.Sprintf("%s/api/v1/accounts/%s", base, payTo), &account); err != nil {
-		return false, err
+func tokenRelationshipFailure(token mirrorTokenRelationship, role string) *SignatureCheck {
+	if strings.EqualFold(token.FreezeStatus, "FROZEN") {
+		return &SignatureCheck{
+			Reason:  "token_frozen",
+			Message: fmt.Sprintf("%s token relationship for %s is frozen", role, token.TokenID),
+		}
 	}
-	maxAuto := account.MaxAutomaticTokenAssociations
+	if strings.EqualFold(token.KYCStatus, "REVOKED") {
+		return &SignatureCheck{
+			Reason:  "token_kyc_revoked",
+			Message: fmt.Sprintf("%s token relationship for %s has revoked KYC", role, token.TokenID),
+		}
+	}
+	return nil
+}
+
+func hasAutomaticAssociationSlot(
+	ctx context.Context,
+	httpClient *mirrorHTTP,
+	base, payTo string,
+	maxAuto int,
+) (bool, error) {
 	if maxAuto < 0 {
 		return true, nil
 	}

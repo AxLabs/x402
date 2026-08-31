@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera"
@@ -157,7 +158,10 @@ func parseMoneyToDecimal(price x402.Price) (float64, error) {
 	case int64:
 		return float64(v), nil
 	case string:
-		return strconv.ParseFloat(v, 64)
+		cleanPrice := strings.TrimSpace(v)
+		cleanPrice = strings.TrimPrefix(cleanPrice, "$")
+		cleanPrice = strings.TrimSpace(cleanPrice)
+		return strconv.ParseFloat(cleanPrice, 64)
 	default:
 		return 0, fmt.Errorf("unsupported money type %T", price)
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"strconv"
+	"sync/atomic"
 	"testing"
 
 	hiero "github.com/hiero-ledger/hiero-sdk-go/v2/sdk"
@@ -22,16 +23,35 @@ type mockSigner struct {
 	resolveEr error
 	sig       hedera.SignatureCheck
 	preflight hedera.SignatureCheck
+	sigPayers []string
+	prePayers []string
+}
+
+type blockingSigner struct {
+	*mockSigner
+	started chan struct{}
+	release chan struct{}
+	calls   atomic.Int32
+}
+
+func (s *blockingSigner) SignAndSubmitTransaction(context.Context, string, string, string) (string, error) {
+	if s.calls.Add(1) == 1 {
+		close(s.started)
+	}
+	<-s.release
+	return s.submitTx, s.submitErr
 }
 
 func (m *mockSigner) GetAddresses(context.Context, string) []string { return m.addresses }
 func (m *mockSigner) SignAndSubmitTransaction(context.Context, string, string, string) (string, error) {
 	return m.submitTx, m.submitErr
 }
-func (m *mockSigner) VerifyPayerSignature(context.Context, string, string, string) hedera.SignatureCheck {
+func (m *mockSigner) VerifyPayerSignature(_ context.Context, payer, _, _ string) hedera.SignatureCheck {
+	m.sigPayers = append(m.sigPayers, payer)
 	return m.sig
 }
-func (m *mockSigner) PreflightTransfer(context.Context, string, string, string, string, string) hedera.SignatureCheck {
+func (m *mockSigner) PreflightTransfer(_ context.Context, payer, _, _, _, _ string) hedera.SignatureCheck {
+	m.prePayers = append(m.prePayers, payer)
 	return m.preflight
 }
 func (m *mockSigner) ResolveAccount(context.Context, string, string) (hedera.AccountResolution, error) {
@@ -66,7 +86,7 @@ func basePayload(req types.PaymentRequirements, txB64 string) types.PaymentPaylo
 		Resource: &types.ResourceInfo{
 			URL:         "https://example.com",
 			Description: "resource",
-			MimeType:     "application/json",
+			MimeType:    "application/json",
 		},
 		Accepted: req,
 		Payload:  map[string]interface{}{"transaction": txB64},
@@ -117,6 +137,50 @@ func createTransferB64(t *testing.T, feePayer, payer, payTo, asset, amount strin
 		t.Fatal(err)
 	}
 	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func createCustomTransferB64(
+	t *testing.T,
+	feePayer string,
+	configure func(*hiero.TransferTransaction),
+) string {
+	t.Helper()
+	client := hiero.ClientForTestnet()
+	defer client.Close()
+	feeID, err := hiero.AccountIDFromString(feePayer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := hiero.NewTransferTransaction().
+		SetTransactionID(hiero.TransactionIDGenerate(feeID))
+	configure(tx)
+	frozen, err := tx.FreezeWith(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := frozen.ToBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func mustAccountID(t *testing.T, value string) hiero.AccountID {
+	t.Helper()
+	id, err := hiero.AccountIDFromString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mustTokenID(t *testing.T, value string) hiero.TokenID {
+	t.Helper()
+	id, err := hiero.TokenIDFromString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func createTopicB64(t *testing.T, feePayer string) string {
@@ -221,6 +285,208 @@ func TestFacilitatorSettle(t *testing.T) {
 	}
 	if !settled.Success || settled.Transaction != signer.submitTx {
 		t.Fatalf("settled=%+v", settled)
+	}
+}
+
+func TestFacilitatorTransferInvariants(t *testing.T) {
+	const (
+		feePayer = "0.0.5001"
+		payer    = "0.0.9001"
+		payTo    = "0.0.7001"
+		third    = "0.0.7002"
+		asset    = "0.0.6001"
+	)
+
+	t.Run("valid_hbar", func(t *testing.T) {
+		req := baseRequirements()
+		req.Asset = hedera.HBARAssetID
+		req.Amount = "50"
+		payload := basePayload(req, createTransferB64(t, feePayer, payer, payTo, req.Asset, req.Amount))
+		resp, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(context.Background(), payload, req, nil)
+		if err != nil || !resp.IsValid || resp.Payer != payer {
+			t.Fatalf("resp=%+v err=%v", resp, err)
+		}
+	})
+
+	t.Run("hbar_sum_non_zero", func(t *testing.T) {
+		req := baseRequirements()
+		req.Asset = hedera.HBARAssetID
+		req.Amount = "50"
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			tx.AddHbarTransfer(mustAccountID(t, payer), hiero.HbarFromTinybar(-49))
+			tx.AddHbarTransfer(mustAccountID(t, payTo), hiero.HbarFromTinybar(50))
+		})
+		_, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if verifyReason(t, err) != facilitator.ErrHbarSumNonZero {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
+	t.Run("asset_sum_non_zero", func(t *testing.T) {
+		req := baseRequirements()
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			token := mustTokenID(t, asset)
+			tx.AddTokenTransfer(token, mustAccountID(t, payer), -999)
+			tx.AddTokenTransfer(token, mustAccountID(t, payTo), 1000)
+		})
+		_, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if verifyReason(t, err) != facilitator.ErrAssetSumNonZero {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
+	t.Run("extra_positive_recipient", func(t *testing.T) {
+		req := baseRequirements()
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			token := mustTokenID(t, asset)
+			tx.AddTokenTransfer(token, mustAccountID(t, payer), -1100)
+			tx.AddTokenTransfer(token, mustAccountID(t, payTo), 1000)
+			tx.AddTokenTransfer(token, mustAccountID(t, third), 100)
+		})
+		_, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if verifyReason(t, err) != facilitator.ErrExtraPositiveTransfers {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
+	t.Run("unexpected_hbar_with_token", func(t *testing.T) {
+		req := baseRequirements()
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			token := mustTokenID(t, asset)
+			payerID := mustAccountID(t, payer)
+			payToID := mustAccountID(t, payTo)
+			tx.AddTokenTransfer(token, payerID, -1000)
+			tx.AddTokenTransfer(token, payToID, 1000)
+			tx.AddHbarTransfer(payerID, hiero.HbarFromTinybar(-1))
+			tx.AddHbarTransfer(payToID, hiero.HbarFromTinybar(1))
+		})
+		_, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if verifyReason(t, err) != facilitator.ErrUnexpectedHbarTransfers {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
+	t.Run("fee_payer_debits_token", func(t *testing.T) {
+		req := baseRequirements()
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			token := mustTokenID(t, asset)
+			tx.AddTokenTransfer(token, mustAccountID(t, feePayer), -1000)
+			tx.AddTokenTransfer(token, mustAccountID(t, payTo), 1000)
+		})
+		_, err := facilitator.NewExactHederaScheme(newMockSigner()).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if verifyReason(t, err) != facilitator.ErrFeePayerTransferringFunds {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
+	t.Run("all_payers_are_verified_and_preflighted", func(t *testing.T) {
+		const secondPayer = "0.0.9002"
+		req := baseRequirements()
+		tx := createCustomTransferB64(t, feePayer, func(tx *hiero.TransferTransaction) {
+			token := mustTokenID(t, asset)
+			tx.AddTokenTransfer(token, mustAccountID(t, payer), -600)
+			tx.AddTokenTransfer(token, mustAccountID(t, secondPayer), -400)
+			tx.AddTokenTransfer(token, mustAccountID(t, payTo), 1000)
+		})
+		signer := newMockSigner()
+		resp, err := facilitator.NewExactHederaScheme(signer).Verify(
+			context.Background(), basePayload(req, tx), req, nil,
+		)
+		if err != nil || !resp.IsValid {
+			t.Fatalf("resp=%+v err=%v", resp, err)
+		}
+		if len(signer.sigPayers) != 2 || len(signer.prePayers) != 2 {
+			t.Fatalf("signature payers=%v preflight payers=%v", signer.sigPayers, signer.prePayers)
+		}
+	})
+}
+
+func TestFacilitatorSettleFailureReleasesClaim(t *testing.T) {
+	cache := hedera.NewSettlementCache()
+	signer := newMockSigner()
+	signer.submitErr = errors.New("submit failed")
+	scheme := facilitator.NewExactHederaScheme(signer, cache)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	_, err := scheme.Settle(context.Background(), payload, req, nil)
+	var settleErr *x402.SettleError
+	if !errors.As(err, &settleErr) || settleErr.ErrorReason != facilitator.ErrTransactionFailed {
+		t.Fatalf("expected transaction_failed, got %T %v", err, err)
+	}
+
+	signer.submitErr = nil
+	settled, err := scheme.Settle(context.Background(), payload, req, nil)
+	if err != nil || !settled.Success {
+		t.Fatalf("retry after failed submit: resp=%+v err=%v", settled, err)
+	}
+}
+
+func TestFacilitatorSubmittedFailureKeepsClaim(t *testing.T) {
+	cache := hedera.NewSettlementCache()
+	signer := newMockSigner()
+	signer.submitErr = &hedera.TransactionSubmittedError{
+		TransactionID: signer.submitTx,
+		Err:           context.DeadlineExceeded,
+	}
+	scheme := facilitator.NewExactHederaScheme(signer, cache)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	_, err := scheme.Settle(context.Background(), payload, req, nil)
+	var settleErr *x402.SettleError
+	if !errors.As(err, &settleErr) || settleErr.ErrorReason != facilitator.ErrTransactionFailed {
+		t.Fatalf("expected transaction_failed, got %T %v", err, err)
+	}
+	if settleErr.Transaction != signer.submitTx {
+		t.Fatalf("transaction=%q want %q", settleErr.Transaction, signer.submitTx)
+	}
+
+	signer.submitErr = nil
+	_, err = scheme.Settle(context.Background(), payload, req, nil)
+	if !errors.As(err, &settleErr) || settleErr.ErrorReason != facilitator.ErrReplay {
+		t.Fatalf("expected replay after ambiguous submission, got %T %v", err, err)
+	}
+}
+
+func TestFacilitatorConcurrentSettlementClaimsOnce(t *testing.T) {
+	signer := &blockingSigner{
+		mockSigner: newMockSigner(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	scheme := facilitator.NewExactHederaScheme(signer)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := scheme.Settle(context.Background(), payload, req, nil)
+		firstDone <- err
+	}()
+	<-signer.started
+
+	_, secondErr := scheme.Settle(context.Background(), payload, req, nil)
+	var settleErr *x402.SettleError
+	if !errors.As(secondErr, &settleErr) || settleErr.ErrorReason != facilitator.ErrReplay {
+		t.Fatalf("expected replay while first settlement is in flight, got %T %v", secondErr, secondErr)
+	}
+	close(signer.release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first settlement failed: %v", err)
+	}
+	if calls := signer.calls.Load(); calls != 1 {
+		t.Fatalf("submit calls=%d want 1", calls)
 	}
 }
 

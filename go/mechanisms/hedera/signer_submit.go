@@ -3,6 +3,7 @@ package hedera
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -15,6 +16,18 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+type submissionOutcomeUnknownError struct {
+	err error
+}
+
+func (e *submissionOutcomeUnknownError) Error() string {
+	return e.err.Error()
+}
+
+func (e *submissionOutcomeUnknownError) Unwrap() error {
+	return e.err
+}
+
 // addOperatorSignatures appends the facilitator fee-payer signature to every
 // node variant in a TransactionList while preserving original BodyBytes.
 //
@@ -22,40 +35,33 @@ import (
 // shard/realm encoding), which invalidates JS/TS client signatures. Signing
 // and submitting at the protobuf layer avoids that.
 func addOperatorSignatures(raw []byte, operatorKey hiero.PrivateKey) ([]*services.Transaction, hiero.TransactionID, error) {
-	list := &sdkproto.TransactionList{}
-	if err := proto.Unmarshal(raw, list); err != nil {
-		single := &services.Transaction{}
-		if err2 := proto.Unmarshal(raw, single); err2 != nil {
-			return nil, hiero.TransactionID{}, fmt.Errorf("decode transaction list: %w", err)
-		}
-		list.TransactionList = []*services.Transaction{single}
-	}
-	if len(list.TransactionList) == 0 {
-		return nil, hiero.TransactionID{}, fmt.Errorf("empty transaction list")
+	transactions, err := decodeAndValidateTransactionVariants(raw)
+	if err != nil {
+		return nil, hiero.TransactionID{}, err
 	}
 
 	pub := operatorKey.PublicKey()
 	pubRaw := pub.BytesRaw()
-	out := make([]*services.Transaction, 0, len(list.TransactionList))
+	out := make([]*services.Transaction, 0, len(transactions))
 	var txID hiero.TransactionID
 
-	for _, wire := range list.TransactionList {
+	for _, wire := range transactions {
 		if wire == nil {
 			continue
 		}
 		signed := &services.SignedTransaction{}
-		if len(wire.SignedTransactionBytes) == 0 {
+		if len(wire.GetSignedTransactionBytes()) == 0 {
 			return nil, hiero.TransactionID{}, fmt.Errorf("missing signed transaction bytes")
 		}
-		if err := proto.Unmarshal(wire.SignedTransactionBytes, signed); err != nil {
+		if err := proto.Unmarshal(wire.GetSignedTransactionBytes(), signed); err != nil {
 			return nil, hiero.TransactionID{}, fmt.Errorf("decode signed transaction: %w", err)
 		}
-		if signed.SigMap == nil {
+		if signed.GetSigMap() == nil {
 			signed.SigMap = &services.SignatureMap{}
 		}
 
 		body := &services.TransactionBody{}
-		if err := proto.Unmarshal(signed.BodyBytes, body); err != nil {
+		if err := proto.Unmarshal(signed.GetBodyBytes(), body); err != nil {
 			return nil, hiero.TransactionID{}, fmt.Errorf("decode transaction body: %w", err)
 		}
 		if txID.AccountID == nil {
@@ -64,8 +70,8 @@ func addOperatorSignatures(raw []byte, operatorKey hiero.PrivateKey) ([]*service
 			}
 		}
 
-		if !signatureMapHasKey(signed.SigMap, pubRaw) {
-			sig := operatorKey.Sign(signed.BodyBytes)
+		if !signatureMapHasKey(signed.GetSigMap(), pubRaw) {
+			sig := operatorKey.Sign(signed.GetBodyBytes())
 			signed.SigMap.SigPair = append(signed.SigMap.SigPair, signaturePairFor(pub, sig))
 		}
 
@@ -81,12 +87,58 @@ func addOperatorSignatures(raw []byte, operatorKey hiero.PrivateKey) ([]*service
 	return out, txID, nil
 }
 
+func decodeAndValidateTransactionVariants(raw []byte) ([]*services.Transaction, error) {
+	list := &sdkproto.TransactionList{}
+	if err := proto.Unmarshal(raw, list); err != nil {
+		return nil, fmt.Errorf("decode transaction list: %w", err)
+	}
+	transactions := list.GetTransactionList()
+	if len(transactions) == 0 {
+		single := &services.Transaction{}
+		if err := proto.Unmarshal(raw, single); err != nil {
+			return nil, fmt.Errorf("decode transaction: %w", err)
+		}
+		transactions = []*services.Transaction{single}
+	}
+
+	var expected *services.TransactionBody
+	for i, wire := range transactions {
+		if wire == nil || len(wire.GetSignedTransactionBytes()) == 0 {
+			return nil, fmt.Errorf("transaction variant %d has no signed transaction bytes", i)
+		}
+		signed := &services.SignedTransaction{}
+		if err := proto.Unmarshal(wire.GetSignedTransactionBytes(), signed); err != nil {
+			return nil, fmt.Errorf("decode transaction variant %d: %w", i, err)
+		}
+		if len(signed.GetBodyBytes()) == 0 {
+			return nil, fmt.Errorf("transaction variant %d has no body bytes", i)
+		}
+		body := &services.TransactionBody{}
+		if err := proto.Unmarshal(signed.GetBodyBytes(), body); err != nil {
+			return nil, fmt.Errorf("decode transaction body variant %d: %w", i, err)
+		}
+		normalized := proto.Clone(body).(*services.TransactionBody)
+		normalized.NodeAccountID = nil
+		if expected == nil {
+			expected = normalized
+			continue
+		}
+		if !proto.Equal(expected, normalized) {
+			return nil, fmt.Errorf("transaction variants differ beyond node account id")
+		}
+	}
+	if expected == nil {
+		return nil, fmt.Errorf("empty transaction list")
+	}
+	return transactions, nil
+}
+
 func signatureMapHasKey(sigMap *services.SignatureMap, pubRaw []byte) bool {
 	if sigMap == nil {
 		return false
 	}
-	for _, pair := range sigMap.SigPair {
-		if pair != nil && bytes.Equal(pair.PubKeyPrefix, pubRaw) {
+	for _, pair := range sigMap.GetSigPair() {
+		if pair != nil && bytes.Equal(pair.GetPubKeyPrefix(), pubRaw) {
 			return true
 		}
 	}
@@ -109,35 +161,39 @@ func signaturePairFor(pub hiero.PublicKey, signature []byte) *services.Signature
 }
 
 func transactionIDFromBody(body *services.TransactionBody) (hiero.TransactionID, error) {
-	if body == nil || body.TransactionID == nil || body.TransactionID.AccountID == nil || body.TransactionID.TransactionValidStart == nil {
+	if body == nil || body.GetTransactionID() == nil ||
+		body.GetTransactionID().GetAccountID() == nil ||
+		body.GetTransactionID().GetTransactionValidStart() == nil {
 		return hiero.TransactionID{}, fmt.Errorf("incomplete transaction id")
 	}
-	pb := body.TransactionID
+	pb := body.GetTransactionID()
+	accountID := pb.GetAccountID()
 	acct := fmt.Sprintf("%d.%d.%d",
-		pb.AccountID.GetShardNum(),
-		pb.AccountID.GetRealmNum(),
-		pb.AccountID.GetAccountNum(),
+		accountID.GetShardNum(),
+		accountID.GetRealmNum(),
+		accountID.GetAccountNum(),
 	)
-	vs := pb.TransactionValidStart
-	return hiero.TransactionIdFromString(fmt.Sprintf("%s@%d.%09d", acct, vs.Seconds, vs.Nanos))
+	vs := pb.GetTransactionValidStart()
+	return hiero.TransactionIdFromString(fmt.Sprintf("%s@%d.%09d", acct, vs.GetSeconds(), vs.GetNanos()))
 }
 
 func nodeAccountIDFromSigned(tx *services.Transaction) (hiero.AccountID, error) {
 	signed := &services.SignedTransaction{}
-	if err := proto.Unmarshal(tx.SignedTransactionBytes, signed); err != nil {
+	if err := proto.Unmarshal(tx.GetSignedTransactionBytes(), signed); err != nil {
 		return hiero.AccountID{}, err
 	}
 	body := &services.TransactionBody{}
-	if err := proto.Unmarshal(signed.BodyBytes, body); err != nil {
+	if err := proto.Unmarshal(signed.GetBodyBytes(), body); err != nil {
 		return hiero.AccountID{}, err
 	}
-	if body.NodeAccountID == nil {
+	if body.GetNodeAccountID() == nil {
 		return hiero.AccountID{}, fmt.Errorf("missing node account id")
 	}
+	nodeAccountID := body.GetNodeAccountID()
 	return hiero.AccountID{
-		Shard:   uint64(body.NodeAccountID.GetShardNum()),
-		Realm:   uint64(body.NodeAccountID.GetRealmNum()),
-		Account: uint64(body.NodeAccountID.GetAccountNum()),
+		Shard:   uint64(nodeAccountID.GetShardNum()),
+		Realm:   uint64(nodeAccountID.GetRealmNum()),
+		Account: uint64(nodeAccountID.GetAccountNum()),
 	}, nil
 }
 
@@ -155,6 +211,7 @@ func (s *PrivateKeyFacilitatorSigner) submitSignedTransfers(ctx context.Context,
 	}
 
 	var lastErr error
+	var unknownErr error
 	for _, tx := range txs {
 		nodeID, err := nodeAccountIDFromSigned(tx)
 		if err != nil {
@@ -178,10 +235,17 @@ func (s *PrivateKeyFacilitatorSigner) submitSignedTransfers(ctx context.Context,
 		for _, addr := range addrs[:limit] {
 			if err := grpcCryptoTransfer(ctx, addr, tx); err != nil {
 				lastErr = err
+				var unknown *submissionOutcomeUnknownError
+				if errors.As(err, &unknown) {
+					unknownErr = err
+				}
 				continue
 			}
 			return nil
 		}
+	}
+	if unknownErr != nil {
+		return unknownErr
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no node accepted transaction")
@@ -248,7 +312,9 @@ func grpcCryptoTransfer(ctx context.Context, address string, tx *services.Transa
 
 	resp, err := client.CryptoTransfer(callCtx, tx)
 	if err != nil {
-		return fmt.Errorf("cryptoTransfer %s: %w", address, err)
+		return &submissionOutcomeUnknownError{
+			err: fmt.Errorf("cryptoTransfer %s: %w", address, err),
+		}
 	}
 	code := resp.GetNodeTransactionPrecheckCode()
 	if code != services.ResponseCodeEnum_OK {
