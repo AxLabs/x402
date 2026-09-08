@@ -228,6 +228,13 @@ func IsValidAddress(address string) bool {
 	return err == nil
 }
 
+// IsValidNonZeroAddress checks for a 0x-prefixed, nonzero Ethereum address.
+func IsValidNonZeroAddress(address string) bool {
+	return strings.HasPrefix(address, "0x") &&
+		IsValidAddress(address) &&
+		!strings.EqualFold(address, "0x0000000000000000000000000000000000000000")
+}
+
 // ParseAmount converts a decimal string amount to wei based on token decimals
 func ParseAmount(amount string, decimals int) (*big.Int, error) {
 	// Parse the decimal amount

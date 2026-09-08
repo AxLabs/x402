@@ -20,6 +20,9 @@ type ExactEvmSchemeConfig struct {
 	EIP6492AllowedFactories []string
 	// SimulateInSettle reruns transfer simulation during settle. Verify always simulates.
 	SimulateInSettle bool
+	// ERC7710GasLimit is the explicit simulation and transaction gas limit.
+	// ERC-7710 is disabled when this is zero.
+	ERC7710GasLimit uint64
 }
 
 // ExactEvmScheme implements the SchemeNetworkFacilitator interface for EVM exact payments (V2)
@@ -85,13 +88,21 @@ func (f *ExactEvmScheme) GetSigners(_ x402.Network) []string {
 }
 
 // Verify verifies a V2 payment payload against requirements.
-// Routes to EIP-3009 or Permit2 verification based on payload type.
+// Routes to ERC-7710, Permit2, or EIP-3009 verification.
 func (f *ExactEvmScheme) Verify(
 	ctx context.Context,
 	payload types.PaymentPayload,
 	requirements types.PaymentRequirements,
 	fctx *x402.FacilitatorContext,
 ) (*x402.VerifyResponse, error) {
+	if evm.HasERC7710PayloadFields(payload.Payload) || requestsERC7710(payload.Accepted, requirements) {
+		erc7710Payload, err := evm.ERC7710PayloadFromMap(payload.Payload)
+		if err != nil {
+			return nil, x402.NewVerifyError(ErrInvalidPayload, "", fmt.Sprintf("failed to parse ERC-7710 payload: %s", err.Error()))
+		}
+		return f.verifyERC7710(ctx, payload, requirements, erc7710Payload, fctx, true)
+	}
+
 	isPermit2 := evm.IsPermit2Payload(payload.Payload)
 
 	if isPermit2 {
@@ -106,13 +117,22 @@ func (f *ExactEvmScheme) Verify(
 }
 
 // Settle settles a V2 payment on-chain.
-// Routes to EIP-3009 or Permit2 settlement based on payload type.
+// Routes to ERC-7710, Permit2, or EIP-3009 settlement.
 func (f *ExactEvmScheme) Settle(
 	ctx context.Context,
 	payload types.PaymentPayload,
 	requirements types.PaymentRequirements,
 	fctx *x402.FacilitatorContext,
 ) (*x402.SettleResponse, error) {
+	if evm.HasERC7710PayloadFields(payload.Payload) || requestsERC7710(payload.Accepted, requirements) {
+		erc7710Payload, err := evm.ERC7710PayloadFromMap(payload.Payload)
+		if err != nil {
+			network := x402.Network(payload.Accepted.Network)
+			return nil, x402.NewSettleError(ErrInvalidPayload, "", network, "", fmt.Sprintf("failed to parse ERC-7710 payload: %s", err.Error()))
+		}
+		return f.settleERC7710(ctx, payload, requirements, erc7710Payload, fctx)
+	}
+
 	isPermit2 := evm.IsPermit2Payload(payload.Payload)
 
 	if isPermit2 {
@@ -128,4 +148,20 @@ func (f *ExactEvmScheme) Settle(
 	}
 
 	return f.settleEIP3009(ctx, payload, requirements, fctx)
+}
+
+func requestsERC7710(accepted, requirements types.PaymentRequirements) bool {
+	return assetTransferMethod(accepted) == evm.AssetTransferMethodERC7710 ||
+		assetTransferMethod(requirements) == evm.AssetTransferMethodERC7710
+}
+
+func assetTransferMethod(requirements types.PaymentRequirements) evm.AssetTransferMethod {
+	if requirements.Extra == nil {
+		return evm.AssetTransferMethodEIP3009
+	}
+	method, ok := requirements.Extra["assetTransferMethod"].(string)
+	if !ok {
+		return evm.AssetTransferMethodEIP3009
+	}
+	return evm.AssetTransferMethod(method)
 }

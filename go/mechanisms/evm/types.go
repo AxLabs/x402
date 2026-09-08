@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strings"
 
 	goethtypes "github.com/ethereum/go-ethereum/core/types"
 )
@@ -28,13 +29,14 @@ type ExactEIP3009Payload struct {
 type ExactEvmPayloadV1 = ExactEIP3009Payload
 
 // ExactEvmPayloadV2 is an alias for ExactEIP3009Payload (v2 compatibility)
-// Note: V2 also supports ExactPermit2Payload - use IsPermit2Payload() to check
+// Note: V2 also supports ExactPermit2Payload and ExactERC7710Payload.
 type ExactEvmPayloadV2 = ExactEIP3009Payload
 
 // AssetTransferMethod defines how assets are transferred on EVM chains.
 // The choice affects which on-chain mechanism is used for token transfers:
 //   - eip3009: Uses transferWithAuthorization (USDC, etc.) - recommended for compatible tokens
 //   - permit2: Uses Permit2 + x402Permit2Proxy - universal fallback for any ERC-20
+//   - erc7710: Uses a smart-account delegation through a DelegationManager
 type AssetTransferMethod string
 
 const (
@@ -42,7 +44,78 @@ const (
 	AssetTransferMethodEIP3009 AssetTransferMethod = "eip3009"
 	// AssetTransferMethodPermit2 uses Permit2 + x402Permit2Proxy
 	AssetTransferMethodPermit2 AssetTransferMethod = "permit2"
+	// AssetTransferMethodERC7710 uses ERC-7710 smart-account delegation
+	AssetTransferMethodERC7710 AssetTransferMethod = "erc7710"
 )
+
+// ExactERC7710Payload carries an opaque delegation proof supplied by a wallet
+// or session-delegation provider.
+type ExactERC7710Payload struct {
+	DelegationManager string `json:"delegationManager"`
+	PermissionContext string `json:"permissionContext"`
+	Delegator         string `json:"delegator"`
+}
+
+// ToMap converts an ExactERC7710Payload to a map for JSON marshaling.
+func (p *ExactERC7710Payload) ToMap() map[string]interface{} {
+	return map[string]interface{}{
+		"delegationManager": p.DelegationManager,
+		"permissionContext": p.PermissionContext,
+		"delegator":         p.Delegator,
+	}
+}
+
+// ERC7710PayloadFromMap parses and strictly validates an ERC-7710 payload.
+func ERC7710PayloadFromMap(data map[string]interface{}) (*ExactERC7710Payload, error) {
+	if len(data) != 3 {
+		return nil, fmt.Errorf("ERC-7710 payload must contain exactly delegationManager, permissionContext, and delegator")
+	}
+
+	manager, ok := data["delegationManager"].(string)
+	if !ok || !IsValidNonZeroAddress(manager) {
+		return nil, fmt.Errorf("missing or invalid delegationManager field")
+	}
+	contextHex, ok := data["permissionContext"].(string)
+	if !ok || !isStrictNonEmptyHex(contextHex) {
+		return nil, fmt.Errorf("missing or invalid permissionContext field")
+	}
+	delegator, ok := data["delegator"].(string)
+	if !ok || !IsValidNonZeroAddress(delegator) {
+		return nil, fmt.Errorf("missing or invalid delegator field")
+	}
+
+	return &ExactERC7710Payload{
+		DelegationManager: manager,
+		PermissionContext: contextHex,
+		Delegator:         delegator,
+	}, nil
+}
+
+// IsERC7710Payload reports whether data is a strictly valid ERC-7710 payload.
+func IsERC7710Payload(data map[string]interface{}) bool {
+	_, err := ERC7710PayloadFromMap(data)
+	return err == nil
+}
+
+// HasERC7710PayloadFields detects malformed ERC-7710 payloads for routing.
+func HasERC7710PayloadFields(data map[string]interface{}) bool {
+	_, manager := data["delegationManager"]
+	_, permissionContext := data["permissionContext"]
+	_, delegator := data["delegator"]
+	return manager || permissionContext || delegator
+}
+
+func isStrictNonEmptyHex(value string) bool {
+	if !strings.HasPrefix(value, "0x") || len(value) <= 2 || len(value)%2 != 0 {
+		return false
+	}
+	for _, char := range value[2:] {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
 
 // Permit2TokenPermissions represents the permitted token and amount for Permit2.
 // This is part of the PermitWitnessTransferFrom message structure that gets signed.
@@ -282,6 +355,15 @@ type FacilitatorEvmSigner interface {
 	// GetCode returns the bytecode at the given address
 	// Returns empty slice if address is an EOA or doesn't exist
 	GetCode(ctx context.Context, address string) ([]byte, error)
+}
+
+// FacilitatorEvmSignerWithGasLimitedTransactions is required for ERC-7710.
+// The same explicit caller and gas limit are used for simulation and broadcast.
+type FacilitatorEvmSignerWithGasLimitedTransactions interface {
+	FacilitatorEvmSigner
+
+	SimulateTransaction(ctx context.Context, from string, to string, data []byte, gasLimit uint64) error
+	SendTransactionWithGasLimit(ctx context.Context, from string, to string, data []byte, gasLimit uint64) (string, error)
 }
 
 // TypedDataDomain represents the EIP-712 domain separator

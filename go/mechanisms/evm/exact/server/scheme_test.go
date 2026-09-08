@@ -16,6 +16,7 @@ func TestPaymentFlowsDeclareAuthorizationAndUpfront(t *testing.T) {
 	for _, atm := range []string{
 		string(evm.AssetTransferMethodEIP3009),
 		string(evm.AssetTransferMethodPermit2),
+		string(evm.AssetTransferMethodERC7710),
 	} {
 		require.Contains(t, flows, atm)
 		assert.Equal(t, []x402.PaymentFlowName{x402.PaymentFlowAuthorization, x402.PaymentFlowUpfront}, flows[atm].Supported)

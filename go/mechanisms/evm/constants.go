@@ -24,6 +24,10 @@ const (
 	FunctionSettle           = "settle"
 	FunctionSettleWithPermit = "settleWithPermit"
 
+	// ERC-7710 function names
+	FunctionERC20Transfer     = "transfer"
+	FunctionRedeemDelegations = "redeemDelegations"
+
 	// Transaction status
 	TxStatusSuccess = 1
 	TxStatusFailed  = 0
@@ -234,6 +238,35 @@ var (
 			"name": "balanceOf",
 			"outputs": [{"name": "", "type": "uint256"}],
 			"stateMutability": "view",
+			"type": "function"
+		}
+	]`)
+
+	// ERC20TransferABI encodes the delegated token transfer.
+	ERC20TransferABI = []byte(`[
+		{
+			"inputs": [
+				{"name": "to", "type": "address"},
+				{"name": "amount", "type": "uint256"}
+			],
+			"name": "transfer",
+			"outputs": [{"name": "", "type": "bool"}],
+			"stateMutability": "nonpayable",
+			"type": "function"
+		}
+	]`)
+
+	// ERC7710RedeemDelegationsABI encodes DelegationManager.redeemDelegations.
+	ERC7710RedeemDelegationsABI = []byte(`[
+		{
+			"inputs": [
+				{"name": "permissionContexts", "type": "bytes[]"},
+				{"name": "modes", "type": "bytes32[]"},
+				{"name": "executionCallDatas", "type": "bytes[]"}
+			],
+			"name": "redeemDelegations",
+			"outputs": [],
+			"stateMutability": "nonpayable",
 			"type": "function"
 		}
 	]`)

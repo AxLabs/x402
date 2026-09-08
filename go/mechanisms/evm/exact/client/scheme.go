@@ -17,8 +17,15 @@ import (
 
 // ExactEvmScheme implements the SchemeNetworkClient interface for EVM exact payments (V2)
 type ExactEvmScheme struct {
-	signer evm.ClientEvmSigner
-	config *ExactEvmSchemeConfig
+	signer                 evm.ClientEvmSigner
+	config                 *ExactEvmSchemeConfig
+	erc7710PayloadProvider ERC7710PayloadProvider
+}
+
+// SetERC7710PayloadProvider supplies wallet/session delegation payloads.
+func (c *ExactEvmScheme) SetERC7710PayloadProvider(provider ERC7710PayloadProvider) *ExactEvmScheme {
+	c.erc7710PayloadProvider = provider
+	return c
 }
 
 // NewExactEvmScheme creates a new ExactEvmScheme.
@@ -45,22 +52,24 @@ func (c *ExactEvmScheme) FindDefaultAsset(asset string, network x402.Network) *x
 }
 
 // CreatePaymentPayload creates a V2 payment payload for the exact scheme.
-// Routes to EIP-3009 or Permit2 based on requirements.Extra["assetTransferMethod"].
+// Routes based on requirements.Extra["assetTransferMethod"].
 // Defaults to EIP-3009 for backward compatibility.
 func (c *ExactEvmScheme) CreatePaymentPayload(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
 ) (types.PaymentPayload, error) {
-	assetTransferMethod := evm.AssetTransferMethodEIP3009 // default
-	if requirements.Extra != nil {
-		if method, ok := requirements.Extra["assetTransferMethod"].(string); ok {
-			assetTransferMethod = evm.AssetTransferMethod(method)
-		}
+	assetTransferMethod, err := requestedAssetTransferMethod(requirements)
+	if err != nil {
+		return types.PaymentPayload{}, err
 	}
-	if assetTransferMethod == evm.AssetTransferMethodPermit2 {
+	switch assetTransferMethod {
+	case evm.AssetTransferMethodERC7710:
+		return c.createERC7710Payload(ctx, requirements)
+	case evm.AssetTransferMethodPermit2:
 		return CreatePermit2Payload(ctx, c.signer, requirements)
+	default:
+		return c.createEIP3009Payload(ctx, requirements)
 	}
-	return c.createEIP3009Payload(ctx, requirements)
 }
 
 // CreatePaymentPayloadWithExtensions creates a payment payload with extension awareness.
@@ -72,13 +81,14 @@ func (c *ExactEvmScheme) CreatePaymentPayloadWithExtensions(
 	requirements types.PaymentRequirements,
 	extensions map[string]interface{},
 ) (types.PaymentPayload, error) {
-	assetTransferMethod := evm.AssetTransferMethodEIP3009
-	if requirements.Extra != nil {
-		if method, ok := requirements.Extra["assetTransferMethod"].(string); ok {
-			assetTransferMethod = evm.AssetTransferMethod(method)
-		}
+	assetTransferMethod, err := requestedAssetTransferMethod(requirements)
+	if err != nil {
+		return types.PaymentPayload{}, err
 	}
-	if assetTransferMethod == evm.AssetTransferMethodPermit2 {
+	switch assetTransferMethod {
+	case evm.AssetTransferMethodERC7710:
+		return c.createERC7710Payload(ctx, requirements)
+	case evm.AssetTransferMethodPermit2:
 		result, err := CreatePermit2Payload(ctx, c.signer, requirements)
 		if err != nil {
 			return types.PaymentPayload{}, err
@@ -96,9 +106,29 @@ func (c *ExactEvmScheme) CreatePaymentPayloadWithExtensions(
 		}
 
 		return result, nil
+	default:
+		return c.createEIP3009Payload(ctx, requirements)
 	}
+}
 
-	return c.createEIP3009Payload(ctx, requirements)
+func requestedAssetTransferMethod(requirements types.PaymentRequirements) (evm.AssetTransferMethod, error) {
+	if requirements.Extra == nil {
+		return evm.AssetTransferMethodEIP3009, nil
+	}
+	value, exists := requirements.Extra["assetTransferMethod"]
+	if !exists {
+		return evm.AssetTransferMethodEIP3009, nil
+	}
+	method, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%s: assetTransferMethod must be a string", ErrUnsupportedAssetTransferMethod)
+	}
+	switch evm.AssetTransferMethod(method) {
+	case evm.AssetTransferMethodEIP3009, evm.AssetTransferMethodPermit2, evm.AssetTransferMethodERC7710:
+		return evm.AssetTransferMethod(method), nil
+	default:
+		return "", fmt.Errorf("%s: %s", ErrUnsupportedAssetTransferMethod, method)
+	}
 }
 
 // trySignEip2612Permit attempts to sign an EIP-2612 permit for gasless Permit2 approval.

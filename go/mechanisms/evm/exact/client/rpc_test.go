@@ -11,10 +11,11 @@ import (
 )
 
 type rpcTestSigner struct {
-	address       string
-	signCalls     int
-	nonceCalls    int
-	estimateCalls int
+	address        string
+	signCalls      int
+	typedDataCalls int
+	nonceCalls     int
+	estimateCalls  int
 }
 
 func (s *rpcTestSigner) Address() string {
@@ -31,6 +32,7 @@ func (s *rpcTestSigner) SignTypedData(
 	primaryType string,
 	message map[string]interface{},
 ) ([]byte, error) {
+	s.typedDataCalls++
 	return []byte{1, 2, 3}, nil
 }
 
