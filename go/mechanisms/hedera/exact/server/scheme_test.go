@@ -74,8 +74,8 @@ func TestEnhancePaymentRequirementsCopiesFeePayer(t *testing.T) {
 
 func TestParsePriceCustomMoneyParser(t *testing.T) {
 	s := server.NewExactHederaScheme().
-		RegisterMoneyParser(func(amount float64, network x402.Network) (*x402.AssetAmount, error) {
-			if amount != 2.5 || network != hedera.HederaTestnetCAIP2 {
+		RegisterMoneyParser(func(amount string, network x402.Network) (*x402.AssetAmount, error) {
+			if amount != "2.50" || network != hedera.HederaTestnetCAIP2 {
 				t.Fatalf("amount=%v network=%s", amount, network)
 			}
 			return &x402.AssetAmount{
@@ -90,7 +90,7 @@ func TestParsePriceCustomMoneyParser(t *testing.T) {
 
 	parserErr := errors.New("parser failed")
 	s = server.NewExactHederaScheme().
-		RegisterMoneyParser(func(float64, x402.Network) (*x402.AssetAmount, error) {
+		RegisterMoneyParser(func(string, x402.Network) (*x402.AssetAmount, error) {
 			return nil, parserErr
 		})
 	if _, err := s.ParsePrice("1", x402.Network(hedera.HederaTestnetCAIP2)); !errors.Is(err, parserErr) {

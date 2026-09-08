@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 
 	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera"
@@ -36,6 +34,19 @@ func NewExactHederaScheme(config ...*hedera.ServerConfig) *ExactHederaScheme {
 var _ x402.SchemeNetworkServer = (*ExactHederaScheme)(nil)
 
 func (s *ExactHederaScheme) Scheme() string { return hedera.SchemeExact }
+
+func (s *ExactHederaScheme) DefaultAssetTransferMethod() string {
+	return x402.SDKDefaultAssetTransferMethod
+}
+
+func (s *ExactHederaScheme) PaymentFlows() map[string]x402.PaymentFlowConfig {
+	return map[string]x402.PaymentFlowConfig{
+		x402.SDKDefaultAssetTransferMethod: {
+			Supported: []x402.PaymentFlowName{x402.PaymentFlowAuthorization, x402.PaymentFlowUpfront},
+			Default:   x402.PaymentFlowAuthorization,
+		},
+	}
+}
 
 // RegisterMoneyParser registers a custom money parser (tried in order).
 func (s *ExactHederaScheme) RegisterMoneyParser(parser x402.MoneyParser) *ExactHederaScheme {
@@ -73,7 +84,7 @@ func (s *ExactHederaScheme) ParsePrice(price x402.Price, network x402.Network) (
 		}
 	}
 
-	decimalAmount, err := parseMoneyToDecimal(price)
+	decimalAmount, _, err := x402.ParseMoney(price)
 	if err != nil {
 		return x402.AssetAmount{}, err
 	}
@@ -108,7 +119,7 @@ func (s *ExactHederaScheme) EnhancePaymentRequirements(
 	return requirements, nil
 }
 
-func (s *ExactHederaScheme) defaultMoneyConversion(amount float64, network string) (x402.AssetAmount, error) {
+func (s *ExactHederaScheme) defaultMoneyConversion(amount string, network string) (x402.AssetAmount, error) {
 	tokenConfig := s.defaultAssetFor(network)
 	if tokenConfig == nil {
 		return x402.AssetAmount{}, fmt.Errorf("%s for network %s", ErrNoDefaultAsset, network)
@@ -116,13 +127,9 @@ func (s *ExactHederaScheme) defaultMoneyConversion(amount float64, network strin
 	if !hedera.IsValidAsset(tokenConfig.Asset) || hedera.IsHbarAsset(tokenConfig.Asset) {
 		return x402.AssetAmount{}, errors.New("default Hedera asset must be an HTS fungible token ID")
 	}
-	smallest, err := hedera.ParseAmount(fmt.Sprintf("%g", amount), tokenConfig.Decimals)
+	smallest, err := hedera.ParseAmount(amount, tokenConfig.Decimals)
 	if err != nil {
-		// Prefer fixed decimal formatting for money amounts.
-		smallest, err = hedera.ParseAmount(strconv.FormatFloat(amount, 'f', -1, 64), tokenConfig.Decimals)
-		if err != nil {
-			return x402.AssetAmount{}, err
-		}
+		return x402.AssetAmount{}, err
 	}
 	return x402.AssetAmount{
 		Amount: smallest.String(),
@@ -144,25 +151,5 @@ func (s *ExactHederaScheme) defaultAssetFor(network string) *hedera.DefaultAsset
 		return &hedera.DefaultAssetConfig{Asset: hedera.HederaTestnetUSDC, Decimals: hedera.HederaUSDCDecimals}
 	default:
 		return nil
-	}
-}
-
-func parseMoneyToDecimal(price x402.Price) (float64, error) {
-	switch v := price.(type) {
-	case float64:
-		return v, nil
-	case float32:
-		return float64(v), nil
-	case int:
-		return float64(v), nil
-	case int64:
-		return float64(v), nil
-	case string:
-		cleanPrice := strings.TrimSpace(v)
-		cleanPrice = strings.TrimPrefix(cleanPrice, "$")
-		cleanPrice = strings.TrimSpace(cleanPrice)
-		return strconv.ParseFloat(cleanPrice, 64)
-	default:
-		return 0, fmt.Errorf("unsupported money type %T", price)
 	}
 }
