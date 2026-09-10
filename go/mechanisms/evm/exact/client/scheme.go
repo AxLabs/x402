@@ -64,7 +64,7 @@ func (c *ExactEvmScheme) CreatePaymentPayload(
 	}
 	switch assetTransferMethod {
 	case evm.AssetTransferMethodERC7710:
-		return c.createERC7710Payload(ctx, requirements)
+		return c.createERC7710Payload(ctx, requirements, nil)
 	case evm.AssetTransferMethodPermit2:
 		return CreatePermit2Payload(ctx, c.signer, requirements)
 	default:
@@ -87,7 +87,7 @@ func (c *ExactEvmScheme) CreatePaymentPayloadWithExtensions(
 	}
 	switch assetTransferMethod {
 	case evm.AssetTransferMethodERC7710:
-		return c.createERC7710Payload(ctx, requirements)
+		return c.createERC7710Payload(ctx, requirements, extensions)
 	case evm.AssetTransferMethodPermit2:
 		result, err := CreatePermit2Payload(ctx, c.signer, requirements)
 		if err != nil {

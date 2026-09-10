@@ -27,14 +27,18 @@ type ExactEvmSchemeConfig struct {
 	// addresses the facilitator trusts to execute the requested transfer.
 	// ERC-7710 is disabled when this is empty.
 	ERC7710AllowedDelegationManagers []string
+	// ERC7710AllowInMemoryReplayStore permits process-local replay protection.
+	// Use only for development; production must inject durable shared storage.
+	ERC7710AllowInMemoryReplayStore bool
 }
 
 // ExactEvmScheme implements the SchemeNetworkFacilitator interface for EVM exact payments (V2)
 type ExactEvmScheme struct {
-	signer       evm.FacilitatorEvmSigner
-	config       ExactEvmSchemeConfig
-	pendingStore x402.PendingSettlementStore
-	erc7710Store ERC7710SettlementStore
+	signer                 evm.FacilitatorEvmSigner
+	config                 ExactEvmSchemeConfig
+	pendingStore           x402.PendingSettlementStore
+	erc7710Store           ERC7710SettlementStore
+	erc7710StoreConfigured bool
 }
 
 // NewExactEvmScheme creates a new ExactEvmScheme
@@ -76,6 +80,7 @@ func (f *ExactEvmScheme) SetPendingSettlementStore(store x402.PendingSettlementS
 func (f *ExactEvmScheme) SetERC7710SettlementStore(store ERC7710SettlementStore) {
 	if store != nil {
 		f.erc7710Store = store
+		f.erc7710StoreConfigured = true
 	}
 }
 

@@ -287,6 +287,22 @@ The `payload` field must contain:
 
 **Note:** The structure of `permissionContext` is determined by the specific Delegation Manager implementation. Common implementations (e.g., MetaMask Delegation Framework) use EIP-712 signed delegation chains.
 
+### Payment identity and retries
+
+For reusable delegations, clients MUST include the [payment-identifier extension](../../extensions/payment_identifier.md)
+with a fresh ID for each purchase, and preserve the ID and payment terms on retries.
+The three delegation payload fields remain unchanged. Facilitators bind the ID to
+normalized payment terms, delegation context and resource; conflicting reuse is rejected.
+Without an ID, a permission context represents a single payment for those terms.
+An ID is not a spending authorization: delegation caveats still control spending.
+
+Facilitators MUST persist the signed settlement transaction before broadcasting.
+Recovery rebroadcasts the same signed bytes and reconciles their receipt; it must
+not select a new nonce after an ambiguous RPC response. Records containing signed
+transactions must survive restarts and be shared across replicas without expiry.
+Preparation reservations may expire only before a signed transaction is persisted,
+with generation fencing preventing an old worker from broadcasting.
+
 ### Phase 3: Verification Logic
 
 Unlike EIP-3009 and Permit2, ERC-7710 verification is performed entirely through simulation. The `permissionContext` is opaque to the facilitator but verifiable by simulating the intended action.
@@ -302,7 +318,7 @@ The facilitator:
    - The delegator has sufficient balance of the asset.
    - The transaction will succeed when executed.
 
-If the simulation succeeds, the payment is considered valid. The simulation serves as the sole verification mechanism—no trusted list of Delegation Manager implementations is required.
+Simulation must succeed before accepting the payment. A successful call alone does not prove a token transfer: facilitators may restrict Delegation Managers to trusted implementations and must validate the settlement receipt against the required asset, payer, recipient and exact amount.
 
 **Security Considerations**:
 
@@ -345,7 +361,7 @@ ERC-7710 does not define a canonical Delegation Manager. Implementations may var
 
 - **MetaMask Delegation Framework**: A full-featured implementation supporting EIP-712 signed delegation chains, caveat enforcement, and batch processing. See [gator.metamask.io](https://gator.metamask.io/) for documentation.
 
-Since verification is performed entirely through simulation, facilitators do not need to maintain a trusted list of Delegation Manager implementations.
+Manager allowlists are a facilitator policy. Regardless of that policy, a successful transaction receipt without the expected token transfer must not be reported as a successful settlement.
 
 ### Canonical Permit2
 

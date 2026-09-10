@@ -4,6 +4,7 @@ import "github.com/x402-foundation/x402/go/v2/mechanisms/evm"
 
 // Facilitator error constants for the exact EVM scheme
 const (
+	ErrERC7710PaymentIdentifierConflict = "payment_identifier_conflict"
 	// EIP-3009 Verify errors
 	ErrInvalidScheme               = "invalid_exact_evm_scheme"
 	ErrNetworkMismatch             = "invalid_exact_evm_network_mismatch"
@@ -52,6 +53,7 @@ const (
 	ErrERC7710InvalidAddress              = "invalid_exact_evm_erc7710_address"
 	ErrERC7710InvalidAmount               = "invalid_exact_evm_erc7710_amount"
 	ErrERC7710GasLimitRequired            = "unsupported_exact_evm_erc7710_gas_limit_required"
+	ErrERC7710ReplayStoreRequired         = "unsupported_exact_evm_erc7710_replay_store_required"
 	ErrERC7710SignerUnsupported           = "unsupported_exact_evm_erc7710_signer"
 	ErrERC7710CalldataExceedsGasLimit     = "invalid_exact_evm_erc7710_calldata_exceeds_gas_limit"
 	ErrERC7710DelegationManagerNotAllowed = "unsupported_exact_evm_erc7710_delegation_manager"

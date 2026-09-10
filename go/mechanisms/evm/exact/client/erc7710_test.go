@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"github.com/x402-foundation/x402/go/v2/extensions/paymentidentifier"
 	"math/big"
 	"strings"
 	"testing"
@@ -183,8 +184,8 @@ func TestCreatePaymentPayloadWithExtensionsERC7710DoesNotSignTypedData(t *testin
 	if !evm.IsERC7710Payload(payload.Payload) {
 		t.Fatalf("unexpected payload: %#v", payload.Payload)
 	}
-	if payload.Extensions != nil {
-		t.Fatal("ERC-7710 must not attach gas-sponsor extensions")
+	if len(payload.Extensions) != 1 || payload.Extensions["payment-identifier"] == nil {
+		t.Fatal("ERC-7710 must attach only a payment identifier")
 	}
 	if signer.typedDataCalls != 0 {
 		t.Fatal("ERC-7710 must not use the typed-data signer")
@@ -228,5 +229,32 @@ func TestCreatePaymentPayloadDefaultAndPermit2AreNotERC7710(t *testing.T) {
 	}
 	if !evm.IsPermit2Payload(permit2Payload.Payload) || evm.HasERC7710PayloadFields(permit2Payload.Payload) {
 		t.Fatalf("permit2 route must stay Permit2: %#v", permit2Payload.Payload)
+	}
+}
+
+func TestERC7710ClientPaymentIdentity(t *testing.T) {
+	scheme := NewExactEvmScheme(&rpcTestSigner{}, nil).SetERC7710PayloadProvider(&erc7710ProviderStub{payload: &evm.ExactERC7710Payload{
+		DelegationManager: "0x3333333333333333333333333333333333333333", PermissionContext: "0x1234", Delegator: "0x4444444444444444444444444444444444444444",
+	}})
+	first, err := scheme.CreatePaymentPayload(context.Background(), erc7710ClientRequirements())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := scheme.CreatePaymentPayload(context.Background(), erc7710ClientRequirements())
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, _ := paymentidentifier.ExtractPaymentIdentifier(first, true)
+	secondID, _ := paymentidentifier.ExtractPaymentIdentifier(second, true)
+	if firstID == "" || secondID == "" || firstID == secondID {
+		t.Fatal("distinct purchases require distinct payment IDs")
+	}
+	retry, err := scheme.CreatePaymentPayloadWithExtensions(context.Background(), erc7710ClientRequirements(), first.Extensions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryID, _ := paymentidentifier.ExtractPaymentIdentifier(retry, true)
+	if retryID != firstID {
+		t.Fatal("explicit retry ID changed")
 	}
 }

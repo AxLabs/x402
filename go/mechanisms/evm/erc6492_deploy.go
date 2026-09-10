@@ -21,15 +21,25 @@ func HasEIP6492Deployment(sigData *ERC6492SignatureData) bool {
 	return sigData.Factory != zeroFactory && len(sigData.FactoryCalldata) > 0
 }
 
-// IsContractRevert reports whether err looks like an on-chain contract revert (as opposed to
-// a transport/RPC failure). Used to avoid misreporting an RPC blip during a post-deploy
-// simulation as a deterministic "signature unsupported" rejection. Matches the revert-substring
-// heuristic the EIP-3009 revert-reason parsers already rely on.
-func IsContractRevert(err error) bool {
+// IsDeterministicContractFailure reports execution failures caused by contract
+// bytecode or the configured gas limit, rather than RPC transport faults.
+func IsDeterministicContractFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	return strings.Contains(strings.ToLower(err.Error()), "revert")
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"revert",
+		"out of gas",
+		"invalid opcode",
+		"stack underflow",
+		"stack overflow",
+	} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsFactoryAllowed reports whether factory is present in allowedFactories (case-insensitive).

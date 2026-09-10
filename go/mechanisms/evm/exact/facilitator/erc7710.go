@@ -2,14 +2,18 @@ package facilitator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	goethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/x402-foundation/x402/go/v2/extensions/paymentidentifier"
 
 	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/evm"
@@ -82,6 +86,9 @@ func (f *ExactEvmScheme) verifyERC7710(
 	simulate bool,
 ) (*x402.VerifyResponse, error) {
 	payer := erc7710Payload.Delegator
+	if _, _, err := erc7710PaymentIdentity(payload, requirements, erc7710Payload); err != nil {
+		return nil, x402.NewVerifyError(ErrInvalidPayload, payer, err.Error())
+	}
 	if payload.Accepted.Scheme != evm.SchemeExact || requirements.Scheme != evm.SchemeExact {
 		return nil, x402.NewVerifyError(ErrInvalidScheme, payer, "scheme mismatch")
 	}
@@ -136,10 +143,17 @@ func (f *ExactEvmScheme) verifyERC7710(
 			"delegation manager is not trusted by this facilitator",
 		)
 	}
+	if !f.erc7710StoreConfigured && !f.config.ERC7710AllowInMemoryReplayStore {
+		return nil, x402.NewVerifyError(
+			ErrERC7710ReplayStoreRequired,
+			payer,
+			"durable ERC-7710 replay storage must be configured",
+		)
+	}
 	if permissionContextMinimumGas(erc7710Payload.PermissionContext) > f.config.ERC7710GasLimit {
 		return nil, x402.NewVerifyError(ErrERC7710CalldataExceedsGasLimit, payer, "permissionContext cannot fit within ERC7710GasLimit")
 	}
-	erc7710Signer, ok := f.signer.(evm.FacilitatorEvmSignerWithGasLimitedTransactions)
+	erc7710Signer, ok := f.signer.(evm.FacilitatorEvmSignerWithRecordedTransactions)
 	if !ok {
 		return nil, x402.NewVerifyError(ErrERC7710SignerUnsupported, payer, "signer lacks gas-limited simulation and transaction support")
 	}
@@ -180,7 +194,7 @@ func (f *ExactEvmScheme) verifyERC7710(
 			calldata,
 			f.config.ERC7710GasLimit,
 		); err != nil {
-			if evm.IsContractRevert(err) {
+			if evm.IsDeterministicContractFailure(err) {
 				return nil, x402.NewVerifyError(ErrERC7710SimulationFailed, payer, evm.TruncateErrorMessage(err.Error()))
 			}
 			return nil, fmt.Errorf("ERC-7710 simulation RPC failed: %w", err)
@@ -199,8 +213,11 @@ func (f *ExactEvmScheme) settleERC7710(
 ) (*x402.SettleResponse, error) {
 	network := x402.Network(payload.Accepted.Network)
 	payer := erc7710Payload.Delegator
-	settlementKey := erc7710SettlementKey(erc7710Payload, payload.Accepted, requirements)
-	record, acquired, err := f.erc7710Store.Acquire(ctx, settlementKey)
+	settlementKey, fingerprint, err := erc7710PaymentIdentity(payload, requirements, erc7710Payload)
+	if err != nil {
+		return nil, x402.NewSettleError(ErrInvalidPayload, payer, network, "", err.Error())
+	}
+	record, generation, acquired, err := f.erc7710Store.Acquire(ctx, settlementKey)
 	if err != nil {
 		return nil, x402.NewSettleError(
 			ErrERC7710SettlementFailed,
@@ -211,13 +228,21 @@ func (f *ExactEvmScheme) settleERC7710(
 		)
 	}
 	if !acquired {
+		if record.Fingerprint != "" && record.Fingerprint != fingerprint {
+			return nil, x402.NewSettleError(ErrERC7710PaymentIdentifierConflict, payer, network, "", "payment identifier is already bound to another request")
+		}
 		return f.resumeERC7710Settlement(
-			ctx, settlementKey, record, payer, network, erc7710Payload, requirements,
+			ctx, settlementKey, generation, record, payer, network, erc7710Payload, requirements, fingerprint,
 		)
 	}
 
+	record.Fingerprint = fingerprint
+	if err := f.erc7710Store.Update(ctx, settlementKey, generation, record); err != nil {
+		return nil, x402.NewSettleError(ErrERC7710SettlementFailed, payer, network, "", err.Error())
+	}
+
 	if _, err := f.verifyERC7710(ctx, payload, requirements, erc7710Payload, fctx, f.config.SimulateInSettle); err != nil {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
+		_ = f.erc7710Store.Delete(ctx, settlementKey, generation)
 		verifyErr := &x402.VerifyError{}
 		if errors.As(err, &verifyErr) {
 			return nil, x402.NewSettleError(verifyErr.InvalidReason, verifyErr.Payer, network, "", verifyErr.InvalidMessage)
@@ -227,75 +252,102 @@ func (f *ExactEvmScheme) settleERC7710(
 
 	calldata, err := BuildERC7710RedeemCalldata(erc7710Payload, requirements)
 	if err != nil {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
+		_ = f.erc7710Store.Delete(ctx, settlementKey, generation)
 		return nil, x402.NewSettleError(ErrInvalidPayload, payer, network, "", err.Error())
 	}
 	dataSuffix, err := evm.ResolveDataSuffix(fctx, evm.DataSuffixContext{Payload: payload, Requirements: requirements})
 	if err != nil {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
+		_ = f.erc7710Store.Delete(ctx, settlementKey, generation)
 		return nil, x402.NewSettleError(ErrInvalidPayload, payer, network, "", err.Error())
 	}
 	calldata = append(calldata, dataSuffix...)
-	erc7710Signer := f.signer.(evm.FacilitatorEvmSignerWithGasLimitedTransactions)
+	erc7710Signer := f.signer.(evm.FacilitatorEvmSignerWithRecordedTransactions)
 	caller, err := f.erc7710Caller()
 	if err != nil {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
+		_ = f.erc7710Store.Delete(ctx, settlementKey, generation)
 		return nil, x402.NewSettleError(ErrERC7710SignerUnsupported, payer, network, "", err.Error())
 	}
-	txHash, err := erc7710Signer.SendTransactionWithGasLimit(
-		ctx,
-		caller,
-		erc7710Payload.DelegationManager,
-		calldata,
-		f.config.ERC7710GasLimit,
+	// The signer invokes this while holding its nonce lock, before any RPC send.
+	// Persisting raw bytes closes the crash window between reservation and broadcast.
+	var recordedHash string
+	txHash, sendErr := erc7710Signer.SendTransactionWithGasLimitAndRecord(
+		ctx, caller, erc7710Payload.DelegationManager, calldata, f.config.ERC7710GasLimit,
+		func(raw []byte) error {
+			var tx goethtypes.Transaction
+			if err := tx.UnmarshalBinary(raw); err != nil {
+				return fmt.Errorf("invalid signed transaction: %w", err)
+			}
+			record.Status = ERC7710SettlementBroadcast
+			record.Transaction = tx.Hash().Hex()
+			record.SignedTransaction = append([]byte(nil), raw...)
+			if err := f.erc7710Store.Update(ctx, settlementKey, generation, record); err != nil {
+				return err
+			}
+			recordedHash = record.Transaction
+			return nil
+		},
 	)
-	if err != nil {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
-		return nil, x402.NewSettleError(ErrERC7710SettlementFailed, payer, network, "", evm.TruncateErrorMessage(err.Error()))
+	if recordedHash == "" {
+		// No broadcast was permitted. A lease also recovers this claim after a crash.
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_ = f.erc7710Store.Delete(cleanupCtx, settlementKey, generation)
+		if sendErr == nil {
+			sendErr = fmt.Errorf("signer did not persist the signed transaction before broadcast")
+		}
+		return nil, x402.NewSettleError(ErrERC7710SettlementFailed, payer, network, "", sendErr.Error())
 	}
-	if !evm.IsValidTxHash(txHash) {
-		_ = f.erc7710Store.Delete(ctx, settlementKey)
-		return nil, evm.InvalidBroadcastHashError(ErrERC7710SettlementFailed, payer, network, txHash)
+	if !strings.EqualFold(txHash, recordedHash) || (sendErr != nil && ctx.Err() != nil) {
+		message := "broadcast result is uncertain; retry the same payment"
+		if sendErr != nil {
+			message = evm.TruncateErrorMessage(sendErr.Error())
+		}
+		return nil, x402.NewSettleError(ErrSettlementPending, payer, network, recordedHash, message)
 	}
-	if err := f.erc7710Store.Update(ctx, settlementKey, ERC7710SettlementRecord{
-		Status:      ERC7710SettlementBroadcast,
-		Transaction: txHash,
-	}); err != nil {
-		return nil, x402.NewSettleError(
-			ErrERC7710SettlementFailed,
-			payer,
-			network,
-			txHash,
-			fmt.Sprintf("transaction broadcast but failed to persist for replay protection: %s", err.Error()),
-		)
-	}
+
 	return f.awaitERC7710Settlement(
-		ctx, settlementKey, txHash, payer, network, erc7710Payload, requirements,
+		ctx, settlementKey, generation, txHash, payer, network, erc7710Payload, requirements,
 	)
 }
 
 func (f *ExactEvmScheme) resumeERC7710Settlement(
 	ctx context.Context,
 	settlementKey string,
+	generation uint64,
 	record ERC7710SettlementRecord,
 	payer string,
 	network x402.Network,
 	erc7710Payload *evm.ExactERC7710Payload,
 	requirements types.PaymentRequirements,
+	fingerprint string,
 ) (*x402.SettleResponse, error) {
+	if record.Fingerprint != "" && record.Fingerprint != fingerprint {
+		return nil, x402.NewSettleError(ErrERC7710PaymentIdentifierConflict, payer, network, "", "payment identifier is already bound to another request")
+	}
 	switch record.Status {
 	case ERC7710SettlementProcessing:
-		return nil, x402.NewSettleError(
-			ErrERC7710SettlementFailed,
+		return f.waitForERC7710Settlement(
+			ctx,
+			settlementKey,
 			payer,
 			network,
-			"",
-			"identical ERC-7710 settlement is processing before broadcast",
+			erc7710Payload,
+			requirements,
+			fingerprint,
 		)
 	case ERC7710SettlementBroadcast:
+		if len(record.SignedTransaction) > 0 {
+			signer, ok := f.signer.(evm.FacilitatorEvmSignerWithRecordedTransactions)
+			if !ok {
+				return nil, x402.NewSettleError(ErrERC7710SignerUnsupported, payer, network, record.Transaction, "signer lacks recorded transaction support")
+			}
+			// A nonce error may mean this transaction already mined; its receipt is authoritative.
+			_, _ = signer.SendSignedTransaction(ctx, record.SignedTransaction)
+		}
 		return f.awaitERC7710Settlement(
 			ctx,
 			settlementKey,
+			generation,
 			record.Transaction,
 			payer,
 			network,
@@ -331,9 +383,57 @@ func (f *ExactEvmScheme) resumeERC7710Settlement(
 	}
 }
 
+func (f *ExactEvmScheme) waitForERC7710Settlement(
+	ctx context.Context,
+	settlementKey string,
+	payer string,
+	network x402.Network,
+	erc7710Payload *evm.ExactERC7710Payload,
+	requirements types.PaymentRequirements,
+	fingerprint string,
+) (*x402.SettleResponse, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("wait for concurrent ERC-7710 settlement: %w", ctx.Err())
+		case <-ticker.C:
+			record, generation, found, err := f.erc7710Store.Get(ctx, settlementKey)
+			if err != nil {
+				return nil, fmt.Errorf("read concurrent ERC-7710 settlement: %w", err)
+			}
+			if !found || record.ProcessingExpired() {
+				return nil, x402.NewSettleError(
+					ErrERC7710SettlementFailed,
+					payer,
+					network,
+					"",
+					"concurrent settlement ended before broadcast; retry the same payment",
+				)
+			}
+			if record.Status != ERC7710SettlementProcessing {
+				return f.resumeERC7710Settlement(
+					ctx,
+					settlementKey,
+					generation,
+					record,
+					payer,
+					network,
+					erc7710Payload,
+					requirements,
+					fingerprint,
+				)
+			}
+		}
+	}
+}
+
 func (f *ExactEvmScheme) awaitERC7710Settlement(
 	ctx context.Context,
 	settlementKey string,
+	generation uint64,
 	txHash string,
 	payer string,
 	network x402.Network,
@@ -352,7 +452,7 @@ func (f *ExactEvmScheme) awaitERC7710Settlement(
 	if err != nil {
 		settleErr := &x402.SettleError{}
 		if errors.As(err, &settleErr) && settleErr.ErrorReason != ErrSettlementPending {
-			_ = f.erc7710Store.Update(ctx, settlementKey, ERC7710SettlementRecord{
+			_ = f.erc7710Store.Update(ctx, settlementKey, generation, ERC7710SettlementRecord{
 				Status:       ERC7710SettlementTerminal,
 				Transaction:  txHash,
 				ErrorReason:  settleErr.ErrorReason,
@@ -364,7 +464,7 @@ func (f *ExactEvmScheme) awaitERC7710Settlement(
 	amount, ok := parseERC7710Amount(requirements.Amount)
 	if !ok {
 		return f.terminalERC7710Settlement(
-			ctx, settlementKey, txHash, payer, network, ErrERC7710InvalidAmount, "",
+			ctx, settlementKey, generation, txHash, payer, network, ErrERC7710InvalidAmount, "",
 		)
 	}
 	transferMatched, err := verifyEIP3009TransferEvent(
@@ -380,6 +480,7 @@ func (f *ExactEvmScheme) awaitERC7710Settlement(
 		return f.terminalERC7710Settlement(
 			ctx,
 			settlementKey,
+			generation,
 			txHash,
 			payer,
 			network,
@@ -389,10 +490,10 @@ func (f *ExactEvmScheme) awaitERC7710Settlement(
 	}
 	if !transferMatched {
 		return f.terminalERC7710Settlement(
-			ctx, settlementKey, txHash, payer, network, ErrERC7710TransferEventMismatch, "",
+			ctx, settlementKey, generation, txHash, payer, network, ErrERC7710TransferEventMismatch, "",
 		)
 	}
-	if err := f.erc7710Store.Update(ctx, settlementKey, ERC7710SettlementRecord{
+	if err := f.erc7710Store.Update(ctx, settlementKey, generation, ERC7710SettlementRecord{
 		Status:      ERC7710SettlementSucceeded,
 		Transaction: txHash,
 	}); err != nil {
@@ -410,13 +511,14 @@ func (f *ExactEvmScheme) awaitERC7710Settlement(
 func (f *ExactEvmScheme) terminalERC7710Settlement(
 	ctx context.Context,
 	settlementKey string,
+	generation uint64,
 	txHash string,
 	payer string,
 	network x402.Network,
 	reason string,
 	message string,
 ) (*x402.SettleResponse, error) {
-	_ = f.erc7710Store.Update(ctx, settlementKey, ERC7710SettlementRecord{
+	_ = f.erc7710Store.Update(ctx, settlementKey, generation, ERC7710SettlementRecord{
 		Status:       ERC7710SettlementTerminal,
 		Transaction:  txHash,
 		ErrorReason:  reason,
@@ -526,4 +628,36 @@ func canonicalERC7710Amount(value string) string {
 		return amount.String()
 	}
 	return value
+}
+
+// A supplied identifier names a purchase, while the fingerprint binds its terms.
+// Without the extension, a permission context remains a single-payment token.
+func erc7710PaymentIdentity(payload types.PaymentPayload, requirements types.PaymentRequirements, delegated *evm.ExactERC7710Payload) (string, string, error) {
+	base := erc7710SettlementKey(delegated, payload.Accepted, requirements)
+	id, err := paymentidentifier.ExtractPaymentIdentifier(payload, true)
+	if err != nil {
+		return "", "", err
+	}
+	if _, present := payload.Extensions[paymentidentifier.PAYMENT_IDENTIFIER]; present && id == "" {
+		return "", "", fmt.Errorf("payment-identifier requires a valid id")
+	}
+	if id == "" {
+		return base, base, nil
+	}
+	extensions := make(map[string]interface{}, len(payload.Extensions))
+	for k, v := range payload.Extensions {
+		if k != paymentidentifier.PAYMENT_IDENTIFIER {
+			extensions[k] = v
+		}
+	}
+	binding, err := json.Marshal(struct {
+		Resource   *types.ResourceInfo
+		Extensions map[string]interface{}
+	}{payload.Resource, extensions})
+	if err != nil {
+		return "", "", err
+	}
+	fingerprint := crypto.Keccak256Hash([]byte(base), binding).Hex()
+	key := crypto.Keccak256Hash([]byte(strings.Join([]string{"erc7710-payment", string(requirements.Network), strings.ToLower(delegated.Delegator), id}, "\x00"))).Hex()
+	return key, fingerprint, nil
 }

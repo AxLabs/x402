@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
+	"github.com/x402-foundation/x402/go/v2/extensions/paymentidentifier"
 	"math/big"
+	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,6 +32,8 @@ const (
 
 type erc7710FacilitatorSigner struct {
 	*settleMockSigner
+	afterRecord   func()
+	replayCalls   atomic.Int32
 	simulationErr error
 	sendErr       error
 	simulateCalls int
@@ -87,12 +91,43 @@ func (s *erc7710FacilitatorSigner) SendTransactionWithGasLimit(
 	s.sendCalls++
 	s.capture(from, to, data, gasLimit)
 	if s.sendErr != nil {
-		return "", s.sendErr
+		return s.sendTxHash, s.sendErr
 	}
 	if s.sendTxHash != "" {
 		return s.sendTxHash, nil
 	}
-	return "0x" + strings.Repeat("77", 32), nil
+	return erc7710TestTransaction().Hash().Hex(), nil
+}
+
+func erc7710TestTransaction() *goethtypes.Transaction {
+	to := common.HexToAddress(testERC7710Manager)
+	return goethtypes.NewTx(&goethtypes.LegacyTx{To: &to, Gas: testERC7710GasLimit, GasPrice: big.NewInt(1), Data: []byte{1}})
+}
+
+func (s *erc7710FacilitatorSigner) SendTransactionWithGasLimitAndRecord(ctx context.Context, from, to string, data []byte, gas uint64, record func([]byte) error) (string, error) {
+	if s.sendErr != nil && s.sendTxHash == "" {
+		return "", s.sendErr
+	}
+	raw, err := erc7710TestTransaction().MarshalBinary()
+	if err != nil {
+		return "", err
+	}
+	if err := record(raw); err != nil {
+		return "", err
+	}
+	if s.afterRecord != nil {
+		s.afterRecord()
+	}
+	return s.SendTransactionWithGasLimit(ctx, from, to, data, gas)
+}
+
+func (s *erc7710FacilitatorSigner) SendSignedTransaction(_ context.Context, raw []byte) (string, error) {
+	s.replayCalls.Add(1)
+	var tx goethtypes.Transaction
+	if err := tx.UnmarshalBinary(raw); err != nil {
+		return "", err
+	}
+	return tx.Hash().Hex(), nil
 }
 
 func (s *erc7710FacilitatorSigner) capture(from, to string, data []byte, gasLimit uint64) {
@@ -144,6 +179,7 @@ func erc7710Config() *ExactEvmSchemeConfig {
 	return &ExactEvmSchemeConfig{
 		ERC7710GasLimit:                  testERC7710GasLimit,
 		ERC7710AllowedDelegationManagers: []string{testERC7710Manager},
+		ERC7710AllowInMemoryReplayStore:  true,
 	}
 }
 
@@ -230,13 +266,21 @@ func TestVerifyERC7710SimulatesWithFacilitatorCallerAndGasLimit(t *testing.T) {
 }
 
 func TestVerifyERC7710RejectsSimulationFailure(t *testing.T) {
-	payload, requirements, _ := erc7710Fixture()
-	signer := newERC7710FacilitatorSigner()
-	signer.simulationErr = fmt.Errorf("execution reverted: caveat violation")
-	scheme := NewExactEvmScheme(signer, erc7710Config())
+	for name, simulationErr := range map[string]error{
+		"revert":         errors.New("execution reverted: caveat violation"),
+		"out of gas":     errors.New("VM execution error: out of gas"),
+		"invalid opcode": errors.New("invalid opcode: 0xfe"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload, requirements, _ := erc7710Fixture()
+			signer := newERC7710FacilitatorSigner()
+			signer.simulationErr = simulationErr
+			scheme := NewExactEvmScheme(signer, erc7710Config())
 
-	_, err := scheme.Verify(context.Background(), payload, requirements, nil)
-	assertERC7710VerifyReason(t, err, ErrERC7710SimulationFailed)
+			_, err := scheme.Verify(context.Background(), payload, requirements, nil)
+			assertERC7710VerifyReason(t, err, ErrERC7710SimulationFailed)
+		})
+	}
 }
 
 func TestVerifyERC7710ReturnsTransientSimulationFailure(t *testing.T) {
@@ -296,6 +340,22 @@ func TestVerifyERC7710RequiresTrustedDelegationManager(t *testing.T) {
 			t.Fatal("deployed no-op manager reached simulation")
 		}
 	})
+}
+
+func TestVerifyERC7710RequiresDurableReplayStoreByDefault(t *testing.T) {
+	payload, requirements, _ := erc7710Fixture()
+	config := erc7710Config()
+	config.ERC7710AllowInMemoryReplayStore = false
+	scheme := NewExactEvmScheme(newERC7710FacilitatorSigner(), config)
+
+	_, err := scheme.Verify(context.Background(), payload, requirements, nil)
+	assertERC7710VerifyReason(t, err, ErrERC7710ReplayStoreRequired)
+
+	scheme.SetERC7710SettlementStore(NewInMemoryERC7710SettlementStore())
+	response, err := scheme.Verify(context.Background(), payload, requirements, nil)
+	if err != nil || !response.IsValid {
+		t.Fatalf("injected replay store rejected: %v %+v", err, response)
+	}
 }
 
 func TestVerifyERC7710RejectsSignerNetworkMismatch(t *testing.T) {
@@ -375,6 +435,32 @@ func TestSettleERC7710RejectsSendFailure(t *testing.T) {
 
 	_, err := scheme.Settle(context.Background(), payload, requirements, nil)
 	assertSettleErr(t, err, ErrERC7710SettlementFailed, "")
+	_, retryErr := scheme.Settle(context.Background(), payload, requirements, nil)
+	assertSettleErr(t, retryErr, ErrERC7710SettlementFailed, "")
+	if signer.sendCalls != 0 {
+		t.Fatal("preparation failure broadcast a transaction")
+	}
+}
+
+func TestSettleERC7710ReconcilesSendErrorWithHash(t *testing.T) {
+	payload, requirements, _ := erc7710Fixture()
+	successHash := erc7710TestTransaction().Hash().Hex()
+	signer := newERC7710FacilitatorSigner()
+	signer.sendTxHash = successHash
+	signer.sendErr = errors.New("rpc response lost after broadcast")
+	signer.receiptErr = errors.New("rpc: timeout waiting for receipt")
+	scheme := NewExactEvmScheme(signer, erc7710Config())
+
+	_, err := scheme.Settle(context.Background(), payload, requirements, nil)
+	assertSettlementPending(t, err, successHash)
+	signer.receiptErr = nil
+	retry, retryErr := scheme.Settle(context.Background(), payload, requirements, nil)
+	if retryErr != nil || retry.Transaction != successHash {
+		t.Fatalf("lost-response retry failed: %v %+v", retryErr, retry)
+	}
+	if signer.sendCalls != 1 {
+		t.Fatalf("lost-response retry broadcast %d transactions", signer.sendCalls)
+	}
 }
 
 func TestSettleERC7710ClassifiesTransientSimulationFailure(t *testing.T) {
@@ -393,7 +479,7 @@ func TestSettleERC7710ClassifiesTransientSimulationFailure(t *testing.T) {
 }
 
 func TestSettleERC7710RequiresExactTransferReceipt(t *testing.T) {
-	successHash := "0x" + strings.Repeat("77", 32)
+	successHash := erc7710TestTransaction().Hash().Hex()
 	tests := map[string]func(*evm.TransactionReceipt){
 		"missing log": func(receipt *evm.TransactionReceipt) {
 			receipt.Logs = nil
@@ -639,7 +725,7 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 		}
 		return erc7710SettlementKey(parsed, payload.Accepted, requirements)
 	}
-	successHash := "0x" + strings.Repeat("77", 32)
+	successHash := erc7710TestTransaction().Hash().Hex()
 
 	t.Run("success persists and prevents rebroadcast", func(t *testing.T) {
 		payload, requirements, _ := erc7710Fixture()
@@ -652,7 +738,7 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 		if err != nil || !resp.Success {
 			t.Fatalf("Settle failed: %v %+v", err, resp)
 		}
-		record, acquired, err := store.Acquire(context.Background(), settlementKeyFor(payload, requirements))
+		record, _, acquired, err := store.Acquire(context.Background(), settlementKeyFor(payload, requirements))
 		if err != nil || acquired || record.Status != ERC7710SettlementSucceeded || record.Transaction != successHash {
 			t.Fatalf("unexpected completed record: %+v acquired=%v err=%v", record, acquired, err)
 		}
@@ -676,7 +762,7 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 
 		_, err := scheme.Settle(context.Background(), payload, requirements, nil)
 		assertSettlementPending(t, err, successHash)
-		record, acquired, acquireErr := store.Acquire(context.Background(), settlementKeyFor(payload, requirements))
+		record, _, acquired, acquireErr := store.Acquire(context.Background(), settlementKeyFor(payload, requirements))
 		if acquireErr != nil || acquired ||
 			record.Status != ERC7710SettlementBroadcast ||
 			record.Transaction != successHash {
@@ -701,10 +787,11 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 		scheme.SetERC7710SettlementStore(store)
 		prior := "0x" + strings.Repeat("ab", 32)
 		key := settlementKeyFor(payload, requirements)
-		if _, acquired, err := store.Acquire(context.Background(), key); err != nil || !acquired {
+		_, generation, acquired, err := store.Acquire(context.Background(), key)
+		if err != nil || !acquired {
 			t.Fatalf("reserve settlement: acquired=%v err=%v", acquired, err)
 		}
-		if err := store.Update(context.Background(), key, ERC7710SettlementRecord{
+		if err := store.Update(context.Background(), key, generation, ERC7710SettlementRecord{
 			Status: ERC7710SettlementBroadcast, Transaction: prior,
 		}); err != nil {
 			t.Fatal(err)
@@ -717,7 +804,7 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 		if signer.sendCalls != 0 || signer.simulateCalls != 0 {
 			t.Fatalf("cache hit must not re-broadcast, send=%d simulate=%d", signer.sendCalls, signer.simulateCalls)
 		}
-		record, acquired, err := store.Acquire(context.Background(), key)
+		record, _, acquired, err := store.Acquire(context.Background(), key)
 		if err != nil || acquired || record.Status != ERC7710SettlementSucceeded {
 			t.Fatalf("unexpected reconciled record: %+v acquired=%v err=%v", record, acquired, err)
 		}
@@ -732,12 +819,12 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 
 		_, err := scheme.Settle(context.Background(), payload, requirements, nil)
 		assertSettleErr(t, err, ErrERC7710GasLimitRequired, "")
-		if _, acquired, acquireErr := store.Acquire(context.Background(), key); acquireErr != nil || !acquired {
+		if _, _, acquired, acquireErr := store.Acquire(context.Background(), key); acquireErr != nil || !acquired {
 			t.Fatalf("verify failure left a record: acquired=%v err=%v", acquired, acquireErr)
 		}
 	})
 
-	t.Run("invalid broadcast hash never populates store", func(t *testing.T) {
+	t.Run("invalid broadcast response retains persisted transaction", func(t *testing.T) {
 		payload, requirements, _ := erc7710Fixture()
 		signer := newERC7710FacilitatorSigner()
 		signer.sendTxHash = "0xnothash"
@@ -747,9 +834,10 @@ func TestSettleERC7710ReplayStore(t *testing.T) {
 		key := settlementKeyFor(payload, requirements)
 
 		_, err := scheme.Settle(context.Background(), payload, requirements, nil)
-		assertSettleErr(t, err, ErrERC7710SettlementFailed, "")
-		if _, acquired, acquireErr := store.Acquire(context.Background(), key); acquireErr != nil || !acquired {
-			t.Fatalf("invalid hash left a record: acquired=%v err=%v", acquired, acquireErr)
+		assertSettlementPending(t, err, erc7710TestTransaction().Hash().Hex())
+		record, _, acquired, acquireErr := store.Acquire(context.Background(), key)
+		if acquireErr != nil || acquired || record.Status != ERC7710SettlementBroadcast {
+			t.Fatalf("invalid hash record: %+v acquired=%v err=%v", record, acquired, acquireErr)
 		}
 	})
 }
@@ -777,11 +865,7 @@ func TestSettleERC7710ConcurrentCallsBroadcastOnce(t *testing.T) {
 	close(results)
 
 	for err := range results {
-		if err == nil {
-			continue
-		}
-		settleErr := &x402.SettleError{}
-		if !errors.As(err, &settleErr) || settleErr.ErrorReason != ErrERC7710SettlementFailed {
+		if err != nil {
 			t.Fatalf("unexpected concurrent result: %v", err)
 		}
 	}
@@ -821,7 +905,7 @@ func TestSettleERC7710CanonicalReplayDoesNotRebroadcast(t *testing.T) {
 
 func TestSettleERC7710StoreFailuresFailClosed(t *testing.T) {
 	payload, requirements, _ := erc7710Fixture()
-	successHash := "0x" + strings.Repeat("77", 32)
+	successHash := erc7710TestTransaction().Hash().Hex()
 
 	t.Run("acquire failure prevents broadcast", func(t *testing.T) {
 		signer := newERC7710FacilitatorSigner()
@@ -839,7 +923,7 @@ func TestSettleERC7710StoreFailuresFailClosed(t *testing.T) {
 		}
 	})
 
-	t.Run("broadcast persistence failure preserves hash", func(t *testing.T) {
+	t.Run("reservation fence failure prevents broadcast", func(t *testing.T) {
 		signer := newERC7710FacilitatorSigner()
 		scheme := NewExactEvmScheme(signer, erc7710Config())
 		store := &failingERC7710SettlementStore{
@@ -849,11 +933,25 @@ func TestSettleERC7710StoreFailuresFailClosed(t *testing.T) {
 		scheme.SetERC7710SettlementStore(store)
 
 		_, err := scheme.Settle(context.Background(), payload, requirements, nil)
-		assertSettleErr(t, err, ErrERC7710SettlementFailed, successHash)
-		_, retryErr := scheme.Settle(context.Background(), payload, requirements, nil)
-		assertSettleErr(t, retryErr, ErrERC7710SettlementFailed, "")
-		if signer.sendCalls != 1 {
-			t.Fatalf("expected one broadcast, got %d", signer.sendCalls)
+		assertSettleErr(t, err, ErrERC7710SettlementFailed, "")
+		if signer.sendCalls != 0 {
+			t.Fatal("reservation fence failure reached broadcast")
+		}
+	})
+
+	t.Run("persistence failure prevents broadcast and permits recovery", func(t *testing.T) {
+		signer := newERC7710FacilitatorSigner()
+		scheme := NewExactEvmScheme(signer, erc7710Config())
+		store := &failingERC7710SettlementStore{InMemoryERC7710SettlementStore: NewInMemoryERC7710SettlementStore(), failUpdate: 2}
+		scheme.SetERC7710SettlementStore(store)
+		_, err := scheme.Settle(context.Background(), payload, requirements, nil)
+		assertSettleErr(t, err, ErrERC7710SettlementFailed, "")
+		if signer.sendCalls != 0 {
+			t.Fatal("broadcast preceded durable persistence")
+		}
+		retry, err := scheme.Settle(context.Background(), payload, requirements, nil)
+		if err != nil || !retry.Success || signer.sendCalls != 1 {
+			t.Fatalf("recovery: %+v %v sends=%d", retry, err, signer.sendCalls)
 		}
 	})
 
@@ -862,7 +960,7 @@ func TestSettleERC7710StoreFailuresFailClosed(t *testing.T) {
 		scheme := NewExactEvmScheme(signer, erc7710Config())
 		store := &failingERC7710SettlementStore{
 			InMemoryERC7710SettlementStore: NewInMemoryERC7710SettlementStore(),
-			failUpdate:                     2,
+			failUpdate:                     3,
 		}
 		scheme.SetERC7710SettlementStore(store)
 
@@ -924,28 +1022,59 @@ func TestERC7710SettlementKeyBindsContextAndRequirements(t *testing.T) {
 	assertDifferent("server requirements", parsed, payload.Accepted, changedRequirements)
 }
 
-func TestInMemoryERC7710SettlementStoreRetainsCompletedUntilTTL(t *testing.T) {
+func TestInMemoryERC7710SettlementStoreRetainsCompleted(t *testing.T) {
 	ctx := context.Background()
 	store := NewInMemoryERC7710SettlementStore()
-	if _, acquired, err := store.Acquire(ctx, "payment"); err != nil || !acquired {
+	_, generation, acquired, err := store.Acquire(ctx, "payment")
+	if err != nil || !acquired {
 		t.Fatalf("Acquire: acquired=%v err=%v", acquired, err)
 	}
 	completed := ERC7710SettlementRecord{
 		Status:      ERC7710SettlementSucceeded,
-		Transaction: "0x" + strings.Repeat("77", 32),
+		Transaction: erc7710TestTransaction().Hash().Hex(),
 	}
-	if err := store.Update(ctx, "payment", completed); err != nil {
+	if err := store.Update(ctx, "payment", generation, completed); err != nil {
 		t.Fatal(err)
 	}
-	if record, acquired, err := store.Acquire(ctx, "payment"); err != nil || acquired || record != completed {
-		t.Fatalf("completed record not retained: %+v acquired=%v err=%v", record, acquired, err)
+	for range 2 {
+		record, gotGeneration, acquired, err := store.Acquire(ctx, "payment")
+		if err != nil || acquired || gotGeneration != generation || !reflect.DeepEqual(record, completed) {
+			t.Fatalf(
+				"completed record not retained: %+v generation=%d acquired=%v err=%v",
+				record,
+				gotGeneration,
+				acquired,
+				err,
+			)
+		}
 	}
+}
 
-	entry := store.entries["payment"]
-	entry.storedAt = time.Now().Add(-x402.PendingSettlementTTL - time.Second)
-	store.entries["payment"] = entry
-	if _, acquired, err := store.Acquire(ctx, "payment"); err != nil || !acquired {
-		t.Fatalf("expired record was retained: acquired=%v err=%v", acquired, err)
+func TestInMemoryERC7710SettlementStoreFencesStaleGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryERC7710SettlementStore()
+	_, staleGeneration, acquired, err := store.Acquire(ctx, "payment")
+	if err != nil || !acquired {
+		t.Fatalf("first Acquire: acquired=%v err=%v", acquired, err)
+	}
+	if err := store.Delete(ctx, "payment", staleGeneration); err != nil {
+		t.Fatal(err)
+	}
+	currentRecord, currentGeneration, acquired, err := store.Acquire(ctx, "payment")
+	if err != nil || !acquired || currentGeneration == staleGeneration {
+		t.Fatalf("second Acquire: generation=%d acquired=%v err=%v", currentGeneration, acquired, err)
+	}
+	if err := store.Update(ctx, "payment", staleGeneration, ERC7710SettlementRecord{
+		Status: ERC7710SettlementSucceeded,
+	}); err == nil {
+		t.Fatal("stale Update succeeded")
+	}
+	if err := store.Delete(ctx, "payment", staleGeneration); err == nil {
+		t.Fatal("stale Delete succeeded")
+	}
+	record, generation, acquired, err := store.Acquire(ctx, "payment")
+	if err != nil || acquired || generation != currentGeneration || !reflect.DeepEqual(record, currentRecord) {
+		t.Fatalf("completed record not retained: %+v acquired=%v err=%v", record, acquired, err)
 	}
 }
 
@@ -959,9 +1088,9 @@ type failingERC7710SettlementStore struct {
 func (s *failingERC7710SettlementStore) Acquire(
 	ctx context.Context,
 	key string,
-) (ERC7710SettlementRecord, bool, error) {
+) (ERC7710SettlementRecord, uint64, bool, error) {
 	if s.acquireErr != nil {
-		return ERC7710SettlementRecord{}, false, s.acquireErr
+		return ERC7710SettlementRecord{}, 0, false, s.acquireErr
 	}
 	return s.InMemoryERC7710SettlementStore.Acquire(ctx, key)
 }
@@ -969,13 +1098,14 @@ func (s *failingERC7710SettlementStore) Acquire(
 func (s *failingERC7710SettlementStore) Update(
 	ctx context.Context,
 	key string,
+	generation uint64,
 	record ERC7710SettlementRecord,
 ) error {
 	s.updateCall++
 	if s.updateCall == s.failUpdate {
 		return errors.New("store unavailable")
 	}
-	return s.InMemoryERC7710SettlementStore.Update(ctx, key, record)
+	return s.InMemoryERC7710SettlementStore.Update(ctx, key, generation, record)
 }
 
 func TestVerifyDoesNotRouteEIP3009OrPermit2ThroughERC7710(t *testing.T) {
@@ -1039,5 +1169,129 @@ func assertERC7710VerifyReason(t *testing.T, err error, expected string) {
 	}
 	if verifyErr.InvalidReason != expected {
 		t.Fatalf("expected %s, got %s", expected, verifyErr.InvalidReason)
+	}
+}
+
+func withERC7710PaymentID(payload types.PaymentPayload, id string) types.PaymentPayload {
+	payload.Extensions = map[string]interface{}{paymentidentifier.PAYMENT_IDENTIFIER: paymentidentifier.DeclarePaymentIdentifierExtension(false)}
+	_ = paymentidentifier.AppendPaymentIdentifierToExtensions(payload.Extensions, id)
+	return payload
+}
+
+func TestERC7710MultiUsePurchasesAndConflictingIDs(t *testing.T) {
+	payload, requirements, _ := erc7710Fixture()
+	signer := newERC7710FacilitatorSigner()
+	scheme := NewExactEvmScheme(signer, erc7710Config())
+	first := withERC7710PaymentID(payload, "pay_first_purchase")
+	second := withERC7710PaymentID(payload, "pay_second_purchase")
+	for _, request := range []types.PaymentPayload{first, first, second, second} {
+		if response, err := scheme.Settle(context.Background(), request, requirements, nil); err != nil || !response.Success {
+			t.Fatalf("settle: %+v %v", response, err)
+		}
+	}
+	if signer.sendCalls != 2 {
+		t.Fatalf("two purchases sent %d transactions", signer.sendCalls)
+	}
+	changed := first
+	changed.Resource = &types.ResourceInfo{URL: "https://seller.test/another-operation"}
+	_, err := scheme.Settle(context.Background(), changed, requirements, nil)
+	assertSettleErr(t, err, ErrERC7710PaymentIdentifierConflict, "")
+	changed = first
+	changed.Accepted.Amount = "2"
+	changedRequirements := requirements
+	changedRequirements.Amount = "2"
+	_, err = scheme.Settle(context.Background(), changed, changedRequirements, nil)
+	assertSettleErr(t, err, ErrERC7710PaymentIdentifierConflict, "")
+	if signer.sendCalls != 2 {
+		t.Fatal("conflicting request broadcast")
+	}
+}
+
+func TestERC7710RecoversPersistedTransactionAfterRestart(t *testing.T) {
+	payload, requirements, delegated := erc7710Fixture()
+	store := NewInMemoryERC7710SettlementStore()
+	key, fingerprint, err := erc7710PaymentIdentity(payload, requirements, delegated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, generation, _, _ := store.Acquire(context.Background(), key)
+	raw, _ := erc7710TestTransaction().MarshalBinary()
+	record.Status, record.Fingerprint = ERC7710SettlementBroadcast, fingerprint
+	record.Transaction, record.SignedTransaction = erc7710TestTransaction().Hash().Hex(), raw
+	if err := store.Update(context.Background(), key, generation, record); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate death after persisting but before the first RPC send.
+	signer := newERC7710FacilitatorSigner()
+	scheme := NewExactEvmScheme(signer, erc7710Config())
+	scheme.SetERC7710SettlementStore(store)
+	response, err := scheme.Settle(context.Background(), payload, requirements, nil)
+	if err != nil || response.Transaction != record.Transaction || signer.sendCalls != 0 || signer.replayCalls.Load() != 1 {
+		t.Fatalf("restart recovery: %+v %v", response, err)
+	}
+}
+
+func TestERC7710ExpiredPreparationFencesOldWorker(t *testing.T) {
+	store := NewInMemoryERC7710SettlementStore()
+	record, old, _, _ := store.Acquire(context.Background(), "payment")
+	record.LeaseExpiresAt = time.Now().Add(-time.Minute)
+	if err := store.Update(context.Background(), "payment", old, record); err != nil {
+		t.Fatal(err)
+	}
+	_, generation, acquired, err := store.Acquire(context.Background(), "payment")
+	if err != nil || !acquired || old == generation {
+		t.Fatalf("expired acquisition: %d %v %v", generation, acquired, err)
+	}
+	if err := store.Update(context.Background(), "payment", old, ERC7710SettlementRecord{Status: ERC7710SettlementBroadcast}); err == nil {
+		t.Fatal("stale sender permitted to broadcast")
+	}
+}
+
+func TestERC7710CanceledSendReconcilesOnFreshContext(t *testing.T) {
+	payload, requirements, _ := erc7710Fixture()
+	signer := newERC7710FacilitatorSigner()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signer.afterRecord = cancel
+	signer.sendTxHash = erc7710TestTransaction().Hash().Hex()
+	signer.sendErr = context.Canceled
+	scheme := NewExactEvmScheme(signer, erc7710Config())
+	_, err := scheme.Settle(ctx, payload, requirements, nil)
+	assertSettlementPending(t, err, signer.sendTxHash)
+	retry, err := scheme.Settle(context.Background(), payload, requirements, nil)
+	if err != nil || !retry.Success || retry.Transaction != signer.sendTxHash || signer.sendCalls != 1 || signer.replayCalls.Load() != 1 {
+		t.Fatalf("canceled send recovery: %+v %v", retry, err)
+	}
+}
+
+type ambiguousERC7710Store struct {
+	*InMemoryERC7710SettlementStore
+	failed bool
+}
+
+func (s *ambiguousERC7710Store) Update(ctx context.Context, key string, generation uint64, record ERC7710SettlementRecord) error {
+	if err := s.InMemoryERC7710SettlementStore.Update(ctx, key, generation, record); err != nil {
+		return err
+	}
+	if !s.failed && record.Status == ERC7710SettlementBroadcast {
+		s.failed = true
+		return errors.New("commit acknowledgement lost")
+	}
+	return nil
+}
+
+func TestERC7710AmbiguousPersistenceRetainsRecoverableTransaction(t *testing.T) {
+	payload, requirements, _ := erc7710Fixture()
+	signer := newERC7710FacilitatorSigner()
+	scheme := NewExactEvmScheme(signer, erc7710Config())
+	scheme.SetERC7710SettlementStore(&ambiguousERC7710Store{InMemoryERC7710SettlementStore: NewInMemoryERC7710SettlementStore()})
+	_, err := scheme.Settle(context.Background(), payload, requirements, nil)
+	assertSettleErr(t, err, ErrERC7710SettlementFailed, "")
+	if signer.sendCalls != 0 {
+		t.Fatal("broadcast after failed persistence acknowledgement")
+	}
+	retry, err := scheme.Settle(context.Background(), payload, requirements, nil)
+	if err != nil || !retry.Success || signer.sendCalls != 0 || signer.replayCalls.Load() != 1 {
+		t.Fatalf("ambiguous persistence recovery: %+v %v", retry, err)
 	}
 }

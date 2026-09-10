@@ -49,9 +49,8 @@ const (
 )
 
 // ExactERC7710Payload carries an opaque delegation proof supplied by a wallet
-// or session-delegation provider. Providers must issue a permission context
-// unique to one payment and ensure it cannot outlive the facilitator's replay
-// record.
+// or session-delegation provider. Reusable contexts use payment-identifier
+// to distinguish purchases; retries must preserve the identifier.
 type ExactERC7710Payload struct {
 	DelegationManager string `json:"delegationManager"`
 	PermissionContext string `json:"permissionContext"`
@@ -369,6 +368,15 @@ type FacilitatorEvmSignerWithGasLimitedTransactions interface {
 
 	SimulateTransaction(ctx context.Context, from string, to string, data []byte, gasLimit uint64) error
 	SendTransactionWithGasLimit(ctx context.Context, from string, to string, data []byte, gasLimit uint64) (string, error)
+}
+
+// FacilitatorEvmSignerWithRecordedTransactions persists a signed transaction before
+// broadcasting it. A failed record callback MUST prevent broadcast. Retries MUST
+// resend identical bytes, never replace the nonce or sign another transaction.
+type FacilitatorEvmSignerWithRecordedTransactions interface {
+	FacilitatorEvmSignerWithGasLimitedTransactions
+	SendTransactionWithGasLimitAndRecord(ctx context.Context, from, to string, data []byte, gasLimit uint64, record func([]byte) error) (string, error)
+	SendSignedTransaction(ctx context.Context, signedTransaction []byte) (string, error)
 }
 
 // TypedDataDomain represents the EIP-712 domain separator

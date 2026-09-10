@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/x402-foundation/x402/go/v2/extensions/paymentidentifier"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/evm"
 	"github.com/x402-foundation/x402/go/v2/types"
 )
@@ -19,6 +20,7 @@ type ERC7710PayloadProvider interface {
 func (c *ExactEvmScheme) createERC7710Payload(
 	ctx context.Context,
 	requirements types.PaymentRequirements,
+	declared map[string]interface{},
 ) (types.PaymentPayload, error) {
 	if c.erc7710PayloadProvider == nil {
 		return types.PaymentPayload{}, errors.New(ErrERC7710Unsupported)
@@ -56,8 +58,35 @@ func (c *ExactEvmScheme) createERC7710Payload(
 		return types.PaymentPayload{}, fmt.Errorf("%s: %w", ErrERC7710PayloadProviderFailed, err)
 	}
 
+	extensions, err := erc7710PaymentIdentifier(declared)
+	if err != nil {
+		return types.PaymentPayload{}, err
+	}
+
 	return types.PaymentPayload{
 		X402Version: 2,
+		Extensions:  extensions,
 		Payload:     parsed.ToMap(),
 	}, nil
+}
+
+func erc7710PaymentIdentifier(declared map[string]interface{}) (map[string]interface{}, error) {
+	extensions := map[string]interface{}{paymentidentifier.PAYMENT_IDENTIFIER: paymentidentifier.DeclarePaymentIdentifierExtension(false)}
+	id := ""
+	if ext, ok := declared[paymentidentifier.PAYMENT_IDENTIFIER]; ok {
+		if !paymentidentifier.IsPaymentIdentifierExtension(ext) {
+			return nil, fmt.Errorf("invalid payment-identifier declaration")
+		}
+		extensions[paymentidentifier.PAYMENT_IDENTIFIER] = ext
+		var err error
+		id, err = paymentidentifier.ExtractPaymentIdentifier(types.PaymentPayload{Extensions: declared}, true)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := paymentidentifier.AppendPaymentIdentifierToExtensions(extensions, id); err != nil {
+		return nil, err
+	}
+
+	return extensions, nil
 }
