@@ -49,7 +49,9 @@ const (
 )
 
 // ExactERC7710Payload carries an opaque delegation proof supplied by a wallet
-// or session-delegation provider.
+// or session-delegation provider. Providers must issue a permission context
+// unique to one payment and ensure it cannot outlive the facilitator's replay
+// record.
 type ExactERC7710Payload struct {
 	DelegationManager string `json:"delegationManager"`
 	PermissionContext string `json:"permissionContext"`
@@ -110,7 +112,10 @@ func isStrictNonEmptyHex(value string) bool {
 		return false
 	}
 	for _, char := range value[2:] {
-		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+		isDigit := char >= '0' && char <= '9'
+		isLowerHex := char >= 'a' && char <= 'f'
+		isUpperHex := char >= 'A' && char <= 'F'
+		if !isDigit && !isLowerHex && !isUpperHex {
 			return false
 		}
 	}

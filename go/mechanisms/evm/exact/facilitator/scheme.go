@@ -23,6 +23,10 @@ type ExactEvmSchemeConfig struct {
 	// ERC7710GasLimit is the explicit simulation and transaction gas limit.
 	// ERC-7710 is disabled when this is zero.
 	ERC7710GasLimit uint64
+	// ERC7710AllowedDelegationManagers is the allowlist of Delegation Manager
+	// addresses the facilitator trusts to execute the requested transfer.
+	// ERC-7710 is disabled when this is empty.
+	ERC7710AllowedDelegationManagers []string
 }
 
 // ExactEvmScheme implements the SchemeNetworkFacilitator interface for EVM exact payments (V2)
@@ -30,6 +34,7 @@ type ExactEvmScheme struct {
 	signer       evm.FacilitatorEvmSigner
 	config       ExactEvmSchemeConfig
 	pendingStore x402.PendingSettlementStore
+	erc7710Store ERC7710SettlementStore
 }
 
 // NewExactEvmScheme creates a new ExactEvmScheme
@@ -50,6 +55,7 @@ func NewExactEvmScheme(signer evm.FacilitatorEvmSigner, config *ExactEvmSchemeCo
 		signer:       signer,
 		config:       cfg,
 		pendingStore: x402.NewInMemoryPendingSettlementStore(),
+		erc7710Store: NewInMemoryERC7710SettlementStore(),
 	}
 }
 
@@ -62,6 +68,14 @@ func NewExactEvmScheme(signer evm.FacilitatorEvmSigner, config *ExactEvmSchemeCo
 func (f *ExactEvmScheme) SetPendingSettlementStore(store x402.PendingSettlementStore) {
 	if store != nil {
 		f.pendingStore = store
+	}
+}
+
+// SetERC7710SettlementStore overrides the default in-memory replay store.
+// Multi-instance facilitators must inject a shared implementation.
+func (f *ExactEvmScheme) SetERC7710SettlementStore(store ERC7710SettlementStore) {
+	if store != nil {
+		f.erc7710Store = store
 	}
 }
 

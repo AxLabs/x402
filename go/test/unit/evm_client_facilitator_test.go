@@ -255,6 +255,9 @@ func TestCreatePaymentPayloadEIP3009(t *testing.T) {
 		if !evm.IsEIP3009Payload(payload.Payload) {
 			t.Error("Expected EIP-3009 payload")
 		}
+		if evm.HasERC7710PayloadFields(payload.Payload) || evm.IsERC7710Payload(payload.Payload) {
+			t.Error("EIP-3009 payload must not route as ERC-7710")
+		}
 
 		// Parse and verify
 		eip3009Payload, err := evm.PayloadFromMap(payload.Payload)
@@ -348,6 +351,9 @@ func TestCreatePaymentPayloadPermit2(t *testing.T) {
 		if !evm.IsPermit2Payload(payload.Payload) {
 			t.Error("Expected Permit2 payload")
 		}
+		if evm.HasERC7710PayloadFields(payload.Payload) || evm.IsERC7710Payload(payload.Payload) {
+			t.Error("Permit2 payload must not route as ERC-7710")
+		}
 
 		// Parse and verify
 		permit2Payload, err := evm.Permit2PayloadFromMap(payload.Payload)
@@ -426,7 +432,93 @@ func TestCreatePaymentPayloadPermit2(t *testing.T) {
 		if !evm.IsPermit2Payload(payloadPermit2.Payload) {
 			t.Error("Expected Permit2 when assetTransferMethod is permit2")
 		}
+
+		reqERC7710 := types.PaymentRequirements{
+			Scheme:            evm.SchemeExact,
+			Network:           "eip155:84532",
+			Asset:             "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+			Amount:            "1000000",
+			PayTo:             "0x9876543210987654321098765432109876543210",
+			MaxTimeoutSeconds: 300,
+			Extra: map[string]interface{}{
+				"assetTransferMethod": "erc7710",
+			},
+		}
+		erc7710Client := evmclient.NewExactEvmScheme(signer, nil).SetERC7710PayloadProvider(&unitERC7710Provider{
+			payload: &evm.ExactERC7710Payload{
+				DelegationManager: "0x3333333333333333333333333333333333333333",
+				PermissionContext: "0x1234",
+				Delegator:         "0x4444444444444444444444444444444444444444",
+			},
+		})
+		payloadERC7710, err := erc7710Client.CreatePaymentPayload(ctx, reqERC7710)
+		if err != nil {
+			t.Fatalf("ERC-7710 payload: %v", err)
+		}
+		if !evm.IsERC7710Payload(payloadERC7710.Payload) || evm.IsEIP3009Payload(payloadERC7710.Payload) || evm.IsPermit2Payload(payloadERC7710.Payload) {
+			t.Errorf("Expected ERC-7710 when assetTransferMethod is erc7710, got %#v", payloadERC7710.Payload)
+		}
 	})
+}
+
+type unitERC7710Provider struct {
+	payload *evm.ExactERC7710Payload
+}
+
+func (p *unitERC7710Provider) CreateERC7710Payload(
+	_ context.Context,
+	_ types.PaymentRequirements,
+) (*evm.ExactERC7710Payload, error) {
+	return p.payload, nil
+}
+
+func TestCreatePaymentPayloadERC7710(t *testing.T) {
+	ctx := context.Background()
+	signer := &mockClientSigner{address: "0xClientAddress1234567890123456789012"}
+	provider := &unitERC7710Provider{payload: &evm.ExactERC7710Payload{
+		DelegationManager: "0x3333333333333333333333333333333333333333",
+		PermissionContext: "0xabcd",
+		Delegator:         "0x4444444444444444444444444444444444444444",
+	}}
+	client := evmclient.NewExactEvmScheme(signer, nil).SetERC7710PayloadProvider(provider)
+
+	requirements := types.PaymentRequirements{
+		Scheme:            evm.SchemeExact,
+		Network:           "eip155:84532",
+		Asset:             "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+		Amount:            "1000000",
+		PayTo:             "0x9876543210987654321098765432109876543210",
+		MaxTimeoutSeconds: 300,
+		Extra: map[string]interface{}{
+			"assetTransferMethod": "erc7710",
+		},
+	}
+
+	payload, err := client.CreatePaymentPayload(ctx, requirements)
+	if err != nil {
+		t.Fatalf("Failed to create payload: %v", err)
+	}
+	if payload.X402Version != 2 {
+		t.Errorf("Expected version 2, got %d", payload.X402Version)
+	}
+	if !evm.IsERC7710Payload(payload.Payload) {
+		t.Fatalf("Expected ERC-7710 payload, got %#v", payload.Payload)
+	}
+	parsed, err := evm.ERC7710PayloadFromMap(payload.Payload)
+	if err != nil {
+		t.Fatalf("Failed to parse payload: %v", err)
+	}
+	if parsed.DelegationManager != provider.payload.DelegationManager ||
+		parsed.Delegator != provider.payload.Delegator ||
+		parsed.PermissionContext != provider.payload.PermissionContext {
+		t.Fatalf("payload mismatch: %+v", parsed)
+	}
+
+	bare := evmclient.NewExactEvmScheme(signer, nil)
+	_, err = bare.CreatePaymentPayload(ctx, requirements)
+	if err == nil {
+		t.Fatal("expected missing provider to fail")
+	}
 }
 
 // TestGetPermit2AllowanceReadParams tests the helper function
