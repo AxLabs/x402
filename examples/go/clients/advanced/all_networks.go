@@ -34,8 +34,12 @@ import (
 func runAllNetworksExample(ctx context.Context, evmPrivateKey, svmPrivateKey, hederaAccountID, hederaPrivateKey, url string) error {
 	fmt.Println("📦 Creating client with all available networks...\n")
 
-	// Create x402 client
-	client := x402.Newx402Client()
+	// Create x402 client; HBAR is not a default asset, so it must be opted in
+	client := x402.Newx402Client().SetSpendControls(x402.SpendControls{
+		AllowedAssets: []x402.SpendControlAsset{
+			{Network: "hedera:*", Asset: hedera.HBARAssetID, MaxAmountPerPayment: "1000000"}, // 0.01 HBAR in tinybars
+		},
+	})
 
 	// Register EVM scheme if private key is provided
 	if evmPrivateKey != "" {
