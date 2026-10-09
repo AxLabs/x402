@@ -514,6 +514,43 @@ func TestFacilitatorReasonMatrix(t *testing.T) {
 		}
 	})
 
+	for _, tt := range []struct {
+		name   string
+		method interface{}
+		reason string
+	}{
+		{name: "transfer_executor", method: hedera.AssetTransferMethodTransferExecutor, reason: facilitator.ErrUnsupportedAssetTransferMethod},
+		{name: "unknown_method", method: "eip3009", reason: facilitator.ErrInvalidAssetTransferMethod},
+		{name: "non_string_method", method: 1, reason: facilitator.ErrInvalidAssetTransferMethod},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bad := req
+			bad.Extra = map[string]interface{}{"feePayer": "0.0.5001", "assetTransferMethod": tt.method}
+			_, err := scheme.Verify(context.Background(), basePayload(bad, ""), bad, nil)
+			if verifyReason(t, err) != tt.reason {
+				t.Fatal(verifyReason(t, err))
+			}
+		})
+	}
+
+	t.Run("explicit_crypto_transfer", func(t *testing.T) {
+		explicit := req
+		explicit.Extra = map[string]interface{}{"feePayer": "0.0.5001", "assetTransferMethod": hedera.AssetTransferMethodCryptoTransfer}
+		payload := basePayload(explicit, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+		if resp, err := scheme.Verify(context.Background(), payload, explicit, nil); err != nil || !resp.IsValid {
+			t.Fatalf("resp=%+v err=%v", resp, err)
+		}
+	})
+
+	t.Run("accepted_method_mismatch", func(t *testing.T) {
+		executor := req
+		executor.Extra = map[string]interface{}{"feePayer": "0.0.5001", "assetTransferMethod": hedera.AssetTransferMethodTransferExecutor}
+		_, err := scheme.Verify(context.Background(), basePayload(req, ""), executor, nil)
+		if verifyReason(t, err) != facilitator.ErrAcceptedMismatch {
+			t.Fatal(verifyReason(t, err))
+		}
+	})
+
 	t.Run("network_mismatch", func(t *testing.T) {
 		payload := basePayload(req, "")
 		payload.Accepted.Network = hedera.HederaMainnetCAIP2

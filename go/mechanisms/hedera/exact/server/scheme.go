@@ -39,6 +39,18 @@ func (s *ExactHederaScheme) DefaultAssetTransferMethod() string {
 	return x402.SDKDefaultAssetTransferMethod
 }
 
+// GetAssetDecimals implements AssetDecimalsProvider for configured and known default assets.
+func (s *ExactHederaScheme) GetAssetDecimals(asset string, network x402.Network) (int, bool) {
+	if cfg := s.defaultAssetFor(string(network)); cfg != nil && cfg.Asset == asset {
+		return cfg.Decimals, true
+	}
+	found := hedera.FindDefaultAsset(asset, string(network))
+	if found == nil {
+		return 0, false
+	}
+	return found.Decimals, true
+}
+
 func (s *ExactHederaScheme) PaymentFlows() map[string]x402.PaymentFlowConfig {
 	return map[string]x402.PaymentFlowConfig{
 		x402.SDKDefaultAssetTransferMethod: {
@@ -144,12 +156,9 @@ func (s *ExactHederaScheme) defaultAssetFor(network string) *hedera.DefaultAsset
 			return &cfg
 		}
 	}
-	switch network {
-	case hedera.HederaMainnetCAIP2:
-		return &hedera.DefaultAssetConfig{Asset: hedera.HederaMainnetUSDC, Decimals: hedera.HederaUSDCDecimals}
-	case hedera.HederaTestnetCAIP2:
-		return &hedera.DefaultAssetConfig{Asset: hedera.HederaTestnetUSDC, Decimals: hedera.HederaUSDCDecimals}
-	default:
+	info, err := hedera.GetDefaultAsset(network, "")
+	if err != nil {
 		return nil
 	}
+	return &hedera.DefaultAssetConfig{Asset: info.Asset, Decimals: info.Decimals}
 }

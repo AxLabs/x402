@@ -6,6 +6,10 @@ const (
 	// SchemeExact is the scheme identifier for exact payments.
 	SchemeExact = "exact"
 
+	// Asset transfer methods defined by the exact Hedera spec. Absent means cryptoTransfer.
+	AssetTransferMethodCryptoTransfer   = "cryptoTransfer"
+	AssetTransferMethodTransferExecutor = "transferExecutor"
+
 	// HBARAssetID is the x402 asset id for native HBAR (tinybars).
 	HBARAssetID = "0.0.0"
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	sdkproto "github.com/hiero-ledger/hiero-sdk-go/v2/proto/sdk"
@@ -42,7 +43,7 @@ func TestClientCreatePaymentPayload(t *testing.T) {
 		MaxTimeoutSeconds: 180,
 		Extra:             map[string]interface{}{"feePayer": "0.0.5001"},
 	}
-	payload, err := scheme.CreatePaymentPayload(context.Background(), req)
+	payload, err := scheme.CreatePaymentPayload(context.Background(), req, x402.PaymentPayloadContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,9 +64,57 @@ func TestClientRequiresFeePayer(t *testing.T) {
 	_, err := scheme.CreatePaymentPayload(context.Background(), types.PaymentRequirements{
 		Scheme:  hedera.SchemeExact,
 		Network: hedera.HederaTestnetCAIP2,
-	})
-	if err == nil {
-		t.Fatal("expected missing feePayer error")
+	}, x402.PaymentPayloadContext{})
+	if err == nil || !strings.Contains(err.Error(), client.ErrMissingFeePayer) {
+		t.Fatalf("err=%v, want %s", err, client.ErrMissingFeePayer)
+	}
+}
+
+func TestClientAssetTransferMethods(t *testing.T) {
+	tx := base64.StdEncoding.EncodeToString([]byte("fake-tx"))
+	tests := []struct {
+		name    string
+		method  interface{}
+		wantErr bool
+	}{
+		{name: "cryptoTransfer", method: hedera.AssetTransferMethodCryptoTransfer},
+		{name: "transferExecutor", method: hedera.AssetTransferMethodTransferExecutor, wantErr: true},
+		{name: "unknown", method: "eip3009", wantErr: true},
+		{name: "non-string", method: 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme := client.NewExactHederaScheme(&fakeClientSigner{accountID: "0.0.9001", txB64: tx})
+			_, err := scheme.CreatePaymentPayload(context.Background(), types.PaymentRequirements{
+				Scheme:  hedera.SchemeExact,
+				Network: hedera.HederaTestnetCAIP2,
+				Extra:   map[string]interface{}{"feePayer": "0.0.5001", "assetTransferMethod": tt.method},
+			}, x402.PaymentPayloadContext{})
+			if tt.wantErr {
+				if err == nil || !strings.Contains(err.Error(), client.ErrUnsupportedAssetTransferMethod) {
+					t.Fatalf("err=%v, want %s", err, client.ErrUnsupportedAssetTransferMethod)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestClientFindDefaultAsset(t *testing.T) {
+	scheme := client.NewExactHederaScheme(&fakeClientSigner{})
+	got := scheme.FindDefaultAsset(hedera.HederaTestnetUSDC, x402.Network(hedera.HederaTestnetCAIP2))
+	want := hedera.DefaultAssets[hedera.HederaTestnetCAIP2][0]
+	if got == nil || got.Asset != want.Asset || got.Decimals != want.Decimals || got.Symbol != want.Symbol {
+		t.Fatalf("FindDefaultAsset=%+v, want %+v", got, want)
+	}
+	if got := scheme.FindDefaultAsset(hedera.HederaTestnetUSDC, x402.Network(hedera.HederaMainnetCAIP2)); got != nil {
+		t.Fatalf("testnet token resolved on mainnet: %+v", got)
+	}
+	if got := scheme.FindDefaultAsset(hedera.HBARAssetID, x402.Network(hedera.HederaTestnetCAIP2)); got != nil {
+		t.Fatalf("HBAR resolved as default asset: %+v", got)
 	}
 }
 
@@ -86,7 +135,7 @@ func TestClientBuildRealPartialTransfer(t *testing.T) {
 		MaxTimeoutSeconds: 180,
 		Extra:             map[string]interface{}{"feePayer": "0.0.5001"},
 	}
-	payload, err := scheme.CreatePaymentPayload(context.Background(), req)
+	payload, err := scheme.CreatePaymentPayload(context.Background(), req, x402.PaymentPayloadContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +167,7 @@ func TestClientBuildRealPartialTokenTransfer(t *testing.T) {
 		MaxTimeoutSeconds: 180,
 		Extra:             map[string]interface{}{"feePayer": "0.0.5001"},
 	}
-	payload, err := client.NewExactHederaScheme(signer).CreatePaymentPayload(context.Background(), req)
+	payload, err := client.NewExactHederaScheme(signer).CreatePaymentPayload(context.Background(), req, x402.PaymentPayloadContext{})
 	if err != nil {
 		t.Fatal(err)
 	}

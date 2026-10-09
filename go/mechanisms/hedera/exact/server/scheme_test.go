@@ -109,4 +109,21 @@ func TestParsePriceConfiguredDefaultAsset(t *testing.T) {
 	if err != nil || got.Asset != "0.0.6001" || got.Amount != "125" {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
+	if decimals, ok := s.GetAssetDecimals("0.0.6001", x402.Network(network)); !ok || decimals != 2 {
+		t.Fatalf("configured decimals=%d ok=%v", decimals, ok)
+	}
+}
+
+func TestGetAssetDecimals(t *testing.T) {
+	s := server.NewExactHederaScheme()
+	network := x402.Network(hedera.HederaTestnetCAIP2)
+	if decimals, ok := s.GetAssetDecimals(hedera.HederaTestnetUSDC, network); !ok || decimals != hedera.HederaUSDCDecimals {
+		t.Fatalf("USDC decimals=%d ok=%v", decimals, ok)
+	}
+	if _, ok := s.GetAssetDecimals(hedera.HederaMainnetUSDC, network); ok {
+		t.Fatal("mainnet USDC resolved on testnet")
+	}
+	if _, ok := s.GetAssetDecimals("0.0.6001", network); ok {
+		t.Fatal("unknown token resolved")
+	}
 }

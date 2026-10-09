@@ -100,19 +100,11 @@ type DefaultAssetConfig struct {
 	Decimals int
 }
 
-// AssetInfo describes a Hedera fungible token.
-type AssetInfo struct {
-	Address  string
-	Symbol   string
-	Decimals int
-}
-
 // NetworkConfig contains network-specific defaults.
 type NetworkConfig struct {
-	Name         string
-	CAIP2        string
-	MirrorURL    string
-	DefaultAsset AssetInfo
+	Name      string
+	CAIP2     string
+	MirrorURL string
 }
 
 // ClientConfig contains optional client configuration.
@@ -150,21 +142,11 @@ var (
 			Name:      "Hedera Mainnet",
 			CAIP2:     HederaMainnetCAIP2,
 			MirrorURL: HederaMainnetMirrorNodeURL,
-			DefaultAsset: AssetInfo{
-				Address:  HederaMainnetUSDC,
-				Symbol:   "USDC",
-				Decimals: HederaUSDCDecimals,
-			},
 		},
 		HederaTestnetCAIP2: {
 			Name:      "Hedera Testnet",
 			CAIP2:     HederaTestnetCAIP2,
 			MirrorURL: HederaTestnetMirrorNodeURL,
-			DefaultAsset: AssetInfo{
-				Address:  HederaTestnetUSDC,
-				Symbol:   "USDC",
-				Decimals: HederaUSDCDecimals,
-			},
 		},
 	}
 )

@@ -49,6 +49,17 @@ func GetNetworkConfig(network string) (NetworkConfig, error) {
 	return cfg, nil
 }
 
+// AssetTransferMethod returns extra.assetTransferMethod, defaulting to cryptoTransfer
+// when absent. ok is false when the field is present but not a string.
+func AssetTransferMethod(extra map[string]interface{}) (method string, ok bool) {
+	raw, present := extra["assetTransferMethod"]
+	if !present {
+		return AssetTransferMethodCryptoTransfer, true
+	}
+	method, ok = raw.(string)
+	return method, ok
+}
+
 // ExtractTransaction returns the base64 transaction field from a payment payload body.
 func ExtractTransaction(payload map[string]interface{}) (string, error) {
 	if payload == nil {

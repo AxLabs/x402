@@ -83,7 +83,7 @@ func TestHederaExactIntegrationV2(t *testing.T) {
 		},
 	}
 
-	payload, err := hederaclient.NewExactHederaScheme(clientSigner).CreatePaymentPayload(ctx, requirements)
+	payload, err := hederaclient.NewExactHederaScheme(clientSigner).CreatePaymentPayload(ctx, requirements, x402.PaymentPayloadContext{})
 	if err != nil {
 		t.Fatalf("create payload: %v", err)
 	}

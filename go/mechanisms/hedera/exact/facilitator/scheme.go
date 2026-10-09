@@ -151,6 +151,13 @@ func (f *ExactHederaScheme) verifyPayment(
 	if err := acceptedMatchesRequirements(payload.Accepted, requirements); err != nil {
 		return "", err
 	}
+	switch method, ok := hedera.AssetTransferMethod(requirements.Extra); {
+	case ok && method == hedera.AssetTransferMethodCryptoTransfer:
+	case ok && method == hedera.AssetTransferMethodTransferExecutor:
+		return "", &verifyFailure{Reason: ErrUnsupportedAssetTransferMethod, Message: "transferExecutor is not supported"}
+	default:
+		return "", &verifyFailure{Reason: ErrInvalidAssetTransferMethod, Message: fmt.Sprintf("invalid assetTransferMethod: %v", requirements.Extra["assetTransferMethod"])}
+	}
 	if !hedera.IsValidAsset(requirements.Asset) {
 		return "", &verifyFailure{Reason: ErrInvalidAsset, Message: "invalid asset"}
 	}
@@ -319,6 +326,11 @@ func acceptedMatchesRequirements(accepted, requirements types.PaymentRequirement
 	reqFee, _ := extraString(requirements.Extra)
 	if acceptedFee != reqFee {
 		return &verifyFailure{Reason: ErrAcceptedMismatch, Message: "accepted feePayer mismatch"}
+	}
+	acceptedMethod, acceptedOK := hedera.AssetTransferMethod(accepted.Extra)
+	reqMethod, reqOK := hedera.AssetTransferMethod(requirements.Extra)
+	if acceptedOK != reqOK || acceptedMethod != reqMethod {
+		return &verifyFailure{Reason: ErrAcceptedMismatch, Message: "accepted assetTransferMethod mismatch"}
 	}
 	return nil
 }
