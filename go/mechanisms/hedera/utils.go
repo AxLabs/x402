@@ -289,12 +289,12 @@ func ParsePositiveAmount(amount string) (*big.Int, error) {
 }
 
 func mirrorURLForNetwork(network, override string) (string, error) {
-	if override != "" {
-		return strings.TrimRight(override, "/"), nil
-	}
 	cfg, err := GetNetworkConfig(network)
 	if err != nil {
 		return "", err
+	}
+	if override != "" {
+		return strings.TrimRight(override, "/"), nil
 	}
 	return cfg.MirrorURL, nil
 }

@@ -333,12 +333,31 @@ func TestResolveAccountMirror(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{})
 		case "/api/v1/accounts/0.0.7002":
 			http.NotFound(w, r)
+		case "/api/v1/accounts/0.0.9001":
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"balance": map[string]int64{"balance": 100},
+			})
 		default:
 			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer server.Close()
 	client := &mirrorHTTP{client: server.Client()}
+
+	signer := &PrivateKeyFacilitatorSigner{mirrorNodeURL: server.URL, http: client}
+	ctx := context.Background()
+	if res, err := signer.ResolveAccount(ctx, "0.0.7001", HederaTestnetCAIP2); err != nil || !res.Exists {
+		t.Fatalf("signer resolve=%+v err=%v", res, err)
+	}
+	if _, err := signer.ResolveAccount(ctx, "0.0.7001", "hedera:previewnet"); err == nil {
+		t.Fatal("expected unsupported network error")
+	}
+	if got := signer.PreflightTransfer(ctx, "0.0.9001", "0.0.7001", HBARAssetID, "100", HederaTestnetCAIP2); !got.OK {
+		t.Fatalf("signer preflight=%+v", got)
+	}
+	if got := signer.PreflightTransfer(ctx, "0.0.9001", "0.0.7001", HBARAssetID, "100", "hedera:previewnet"); got.OK || got.Reason != "preflight_failed" {
+		t.Fatalf("unsupported network preflight=%+v", got)
+	}
 
 	existing, err := resolveAccountMirror(context.Background(), client, server.URL, "0.0.7001")
 	if err != nil || !existing.Exists || existing.IsAlias {

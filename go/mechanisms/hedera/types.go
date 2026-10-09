@@ -139,7 +139,7 @@ type OperatorCredentials struct {
 // SignerConfig configures the default FacilitatorHederaSigner implementation.
 type SignerConfig struct {
 	Operators     []OperatorCredentials
-	MirrorNodeURL string // optional override; empty uses network default
+	MirrorNodeURL string // optional override applied to every network; empty uses each network's default
 }
 
 var (
