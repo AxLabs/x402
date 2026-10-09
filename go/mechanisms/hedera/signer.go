@@ -95,25 +95,54 @@ func (s *PrivateKeyFacilitatorSigner) SignAndSubmitTransaction(
 	if txID.AccountID == nil || txID.ValidStart == nil {
 		return "", fmt.Errorf("missing transaction id in payload")
 	}
+	txIDString := txID.String()
 	if err := s.submitSignedTransfers(ctx, network, signed); err != nil {
 		var unknown *submissionOutcomeUnknownError
 		if errors.As(err, &unknown) {
-			txIDString := txID.String()
 			return txIDString, &TransactionSubmittedError{
-				TransactionID: txIDString,
-				Err:           err,
+				TransactionID:  txIDString,
+				OutcomeUnknown: true,
+				Err:            err,
 			}
 		}
 		return "", err
 	}
 	if err := s.waitSuccess(ctx, network, *op, txID); err != nil {
-		txIDString := txID.String()
-		return txIDString, &TransactionSubmittedError{
-			TransactionID: txIDString,
-			Err:           err,
-		}
+		return txIDString, receiptError(txIDString, err)
 	}
-	return txID.String(), nil
+	return txIDString, nil
+}
+
+func (s *PrivateKeyFacilitatorSigner) AwaitTransaction(ctx context.Context, transactionID, network string) error {
+	if err := AssertSupportedNetwork(network); err != nil {
+		return err
+	}
+	txID, err := hiero.TransactionIdFromString(transactionID)
+	if err != nil {
+		return err
+	}
+	if txID.AccountID == nil {
+		return fmt.Errorf("missing transaction id account")
+	}
+	op, err := s.findOperator(txID.AccountID.String())
+	if err != nil {
+		return err
+	}
+	if err := s.waitSuccess(ctx, network, *op, txID); err != nil {
+		return receiptError(transactionID, err)
+	}
+	return nil
+}
+
+// receiptError treats only a definitive non-success receipt status as terminal.
+func receiptError(transactionID string, err error) *TransactionSubmittedError {
+	var status hiero.ErrHederaReceiptStatus
+	terminal := errors.As(err, &status) && status.Status != hiero.StatusUnknown
+	return &TransactionSubmittedError{
+		TransactionID:  transactionID,
+		OutcomeUnknown: !terminal,
+		Err:            err,
+	}
 }
 
 func (s *PrivateKeyFacilitatorSigner) VerifyPayerSignature(

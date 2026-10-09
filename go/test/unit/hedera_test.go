@@ -19,6 +19,9 @@ func (s *hederaSmokeSigner) GetAddresses(context.Context, string) []string {
 func (s *hederaSmokeSigner) SignAndSubmitTransaction(context.Context, string, string, string) (string, error) {
 	return "", nil
 }
+func (s *hederaSmokeSigner) AwaitTransaction(context.Context, string, string) error {
+	return nil
+}
 func (s *hederaSmokeSigner) VerifyPayerSignature(context.Context, string, string, string) hedera.SignatureCheck {
 	return hedera.SignatureCheck{OK: true}
 }

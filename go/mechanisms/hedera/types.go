@@ -47,9 +47,12 @@ type AccountResolution struct {
 }
 
 // TransactionSubmittedError reports a failed or unknown outcome after node acceptance.
+// OutcomeUnknown is true when the transaction may still reach consensus (submission or
+// receipt lookup failed) and false when its receipt reported a failure status.
 type TransactionSubmittedError struct {
-	TransactionID string
-	Err           error
+	TransactionID  string
+	OutcomeUnknown bool
+	Err            error
 }
 
 func (e *TransactionSubmittedError) Error() string {
@@ -82,6 +85,10 @@ type FacilitatorHederaSigner interface {
 
 	// SignAndSubmitTransaction co-signs as feePayer and submits; must wait for SUCCESS.
 	SignAndSubmitTransaction(ctx context.Context, transactionBase64, feePayer, network string) (txID string, err error)
+
+	// AwaitTransaction waits for the receipt of a transaction returned by SignAndSubmitTransaction;
+	// nil means SUCCESS. Failures use the same TransactionSubmittedError contract.
+	AwaitTransaction(ctx context.Context, transactionID, network string) error
 
 	// VerifyPayerSignature checks the payer signed the frozen transaction body
 	// (default impl reads the account key from Mirror Node; no operator query).

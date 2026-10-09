@@ -273,6 +273,49 @@ func TestGRPCCryptoTransferTransportErrorIsAmbiguous(t *testing.T) {
 	}
 }
 
+func TestReceiptErrorOutcome(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		err         error
+		wantUnknown bool
+	}{
+		{name: "failed_status", err: hiero.ErrHederaReceiptStatus{Status: hiero.StatusInsufficientTokenBalance}},
+		{name: "unknown_status", err: hiero.ErrHederaReceiptStatus{Status: hiero.StatusUnknown}, wantUnknown: true},
+		{name: "receipt_not_found", err: hiero.ErrHederaPreCheckStatus{Status: hiero.StatusReceiptNotFound}, wantUnknown: true},
+		{name: "deadline", err: context.DeadlineExceeded, wantUnknown: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := receiptError("0.0.5001@1700000001.000000000", tt.err)
+			if got.OutcomeUnknown != tt.wantUnknown || got.Error() != tt.err.Error() {
+				t.Fatalf("receiptError=%+v", got)
+			}
+		})
+	}
+}
+
+func TestAwaitTransactionRejectsInvalidInputs(t *testing.T) {
+	key, err := hiero.PrivateKeyGenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorID, _ := hiero.AccountIDFromString("0.0.5001")
+	signer := &PrivateKeyFacilitatorSigner{
+		operators: []operatorKey{{id: operatorID, key: key}},
+		http:      newMirrorHTTP(),
+	}
+	ctx := context.Background()
+	if err := signer.AwaitTransaction(ctx, "0.0.5001@1700000001.000000000", "hedera:previewnet"); err == nil {
+		t.Fatal("expected unsupported network error")
+	}
+	if err := signer.AwaitTransaction(ctx, "not-a-transaction-id", HederaTestnetCAIP2); err == nil {
+		t.Fatal("expected transaction id parse error")
+	}
+	err = signer.AwaitTransaction(ctx, "0.0.5002@1700000001.000000000", HederaTestnetCAIP2)
+	if err == nil || err.Error() != "fee_payer_not_managed_by_facilitator" {
+		t.Fatalf("expected unmanaged operator error, got %v", err)
+	}
+}
+
 func collectBodyBytes(t *testing.T, raw []byte) [][]byte {
 	t.Helper()
 	list := &sdkproto.TransactionList{}

@@ -25,6 +25,9 @@ type mockSigner struct {
 	preflight hedera.SignatureCheck
 	sigPayers []string
 	prePayers []string
+	awaitErr  error
+	submits   int
+	awaits    []string
 }
 
 type blockingSigner struct {
@@ -44,7 +47,12 @@ func (s *blockingSigner) SignAndSubmitTransaction(context.Context, string, strin
 
 func (m *mockSigner) GetAddresses(context.Context, string) []string { return m.addresses }
 func (m *mockSigner) SignAndSubmitTransaction(context.Context, string, string, string) (string, error) {
+	m.submits++
 	return m.submitTx, m.submitErr
+}
+func (m *mockSigner) AwaitTransaction(_ context.Context, transactionID, _ string) error {
+	m.awaits = append(m.awaits, transactionID)
+	return m.awaitErr
 }
 func (m *mockSigner) VerifyPayerSignature(_ context.Context, payer, _, _ string) hedera.SignatureCheck {
 	m.sigPayers = append(m.sigPayers, payer)
@@ -437,7 +445,7 @@ func TestFacilitatorSubmittedFailureKeepsClaim(t *testing.T) {
 	signer := newMockSigner()
 	signer.submitErr = &hedera.TransactionSubmittedError{
 		TransactionID: signer.submitTx,
-		Err:           context.DeadlineExceeded,
+		Err:           errors.New("exceptional receipt status: INSUFFICIENT_TOKEN_BALANCE"),
 	}
 	scheme := facilitator.NewExactHederaScheme(signer, cache)
 	req := baseRequirements()
@@ -455,7 +463,139 @@ func TestFacilitatorSubmittedFailureKeepsClaim(t *testing.T) {
 	signer.submitErr = nil
 	_, err = scheme.Settle(context.Background(), payload, req, nil)
 	if !errors.As(err, &settleErr) || settleErr.ErrorReason != facilitator.ErrReplay {
-		t.Fatalf("expected replay after ambiguous submission, got %T %v", err, err)
+		t.Fatalf("expected replay after failed receipt, got %T %v", err, err)
+	}
+	if len(signer.awaits) != 0 {
+		t.Fatalf("terminal failure reconciled: %v", signer.awaits)
+	}
+}
+
+func settleReason(t *testing.T, err error) *x402.SettleError {
+	t.Helper()
+	var settleErr *x402.SettleError
+	if !errors.As(err, &settleErr) {
+		t.Fatalf("expected SettleError, got %T %v", err, err)
+	}
+	return settleErr
+}
+
+func unknownOutcome(txID string) error {
+	return &hedera.TransactionSubmittedError{TransactionID: txID, OutcomeUnknown: true, Err: context.DeadlineExceeded}
+}
+
+func TestFacilitatorPendingSettlementReconcilesOnce(t *testing.T) {
+	signer := newMockSigner()
+	signer.submitErr = unknownOutcome(signer.submitTx)
+	scheme := facilitator.NewExactHederaScheme(signer)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	_, err := scheme.Settle(context.Background(), payload, req, nil)
+	pending := settleReason(t, err)
+	if pending.ErrorReason != x402.ErrSettlementPending || pending.Transaction != signer.submitTx || pending.Payer != "0.0.9001" {
+		t.Fatalf("first settle=%+v", pending)
+	}
+
+	signer.awaitErr = unknownOutcome(signer.submitTx)
+	_, err = scheme.Settle(context.Background(), payload, req, nil)
+	if got := settleReason(t, err); got.ErrorReason != x402.ErrSettlementPending || got.Transaction != signer.submitTx {
+		t.Fatalf("still unknown=%+v", got)
+	}
+
+	signer.awaitErr = nil
+	settled, err := scheme.Settle(context.Background(), payload, req, nil)
+	if err != nil || !settled.Success || settled.Transaction != signer.submitTx || settled.Payer != "0.0.9001" {
+		t.Fatalf("reconciled=%+v err=%v", settled, err)
+	}
+
+	_, err = scheme.Settle(context.Background(), payload, req, nil)
+	if got := settleReason(t, err); got.ErrorReason != facilitator.ErrReplay {
+		t.Fatalf("after reconcile reason=%s, want %s", got.ErrorReason, facilitator.ErrReplay)
+	}
+	if signer.submits != 1 || len(signer.awaits) != 2 {
+		t.Fatalf("submits=%d awaits=%v", signer.submits, signer.awaits)
+	}
+}
+
+func TestFacilitatorPendingSettlementTerminalReceipt(t *testing.T) {
+	signer := newMockSigner()
+	signer.submitErr = unknownOutcome(signer.submitTx)
+	scheme := facilitator.NewExactHederaScheme(signer)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	if _, err := scheme.Settle(context.Background(), payload, req, nil); settleReason(t, err).ErrorReason != x402.ErrSettlementPending {
+		t.Fatalf("first settle err=%v", err)
+	}
+	signer.awaitErr = &hedera.TransactionSubmittedError{TransactionID: signer.submitTx, Err: errors.New("INSUFFICIENT_TOKEN_BALANCE")}
+	_, err := scheme.Settle(context.Background(), payload, req, nil)
+	if got := settleReason(t, err); got.ErrorReason != facilitator.ErrTransactionFailed || got.Transaction != signer.submitTx {
+		t.Fatalf("terminal receipt=%+v", got)
+	}
+	_, err = scheme.Settle(context.Background(), payload, req, nil)
+	if got := settleReason(t, err); got.ErrorReason != facilitator.ErrReplay {
+		t.Fatalf("after terminal reason=%s", got.ErrorReason)
+	}
+	if signer.submits != 1 {
+		t.Fatalf("submits=%d want 1", signer.submits)
+	}
+}
+
+func TestFacilitatorPendingKeyBindsPayloadAndRequirements(t *testing.T) {
+	signer := newMockSigner()
+	signer.submitErr = unknownOutcome(signer.submitTx)
+	scheme := facilitator.NewExactHederaScheme(signer)
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+	if _, err := scheme.Settle(context.Background(), payload, req, nil); settleReason(t, err).ErrorReason != x402.ErrSettlementPending {
+		t.Fatalf("first settle err=%v", err)
+	}
+
+	other := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+	signer.submitErr = nil
+	if settled, err := scheme.Settle(context.Background(), other, req, nil); err != nil || !settled.Success {
+		t.Fatalf("other payload=%+v err=%v", settled, err)
+	}
+
+	tx := payload.Payload["transaction"].(string)
+	mainnet := req
+	mainnet.Network = hedera.HederaMainnetCAIP2
+	otherPayTo := req
+	otherPayTo.PayTo = "0.0.7002"
+	for name, mismatched := range map[string]types.PaymentRequirements{"network": mainnet, "payTo": otherPayTo} {
+		_, err := scheme.Settle(context.Background(), basePayload(mismatched, tx), mismatched, nil)
+		if got := settleReason(t, err); got.ErrorReason == x402.ErrSettlementPending || got.Transaction != "" {
+			t.Fatalf("pending record reused across %s: %+v", name, got)
+		}
+	}
+	if len(signer.awaits) != 0 {
+		t.Fatalf("unexpected reconcile: %v", signer.awaits)
+	}
+
+	signer.awaitErr = nil
+	settled, err := scheme.Settle(context.Background(), payload, req, nil)
+	if err != nil || !settled.Success || len(signer.awaits) != 1 {
+		t.Fatalf("original requirements did not reconcile: %+v err=%v awaits=%v", settled, err, signer.awaits)
+	}
+}
+
+type failingPendingStore struct{ x402.PendingSettlementStore }
+
+func (failingPendingStore) Set(context.Context, string, string) error {
+	return errors.New("store down")
+}
+
+func TestFacilitatorPendingStoreFailureIsTerminal(t *testing.T) {
+	signer := newMockSigner()
+	signer.submitErr = unknownOutcome(signer.submitTx)
+	scheme := facilitator.NewExactHederaScheme(signer)
+	scheme.SetPendingSettlementStore(failingPendingStore{x402.NewInMemoryPendingSettlementStore()})
+	req := baseRequirements()
+	payload := basePayload(req, createTransferB64(t, "0.0.5001", "0.0.9001", "0.0.7001", "0.0.6001", "1000"))
+
+	_, err := scheme.Settle(context.Background(), payload, req, nil)
+	if got := settleReason(t, err); got.ErrorReason != facilitator.ErrTransactionFailed || got.Transaction != signer.submitTx {
+		t.Fatalf("store failure=%+v", got)
 	}
 }
 

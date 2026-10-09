@@ -2,12 +2,14 @@ package facilitator
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
 	"math/rand/v2"
 	"regexp"
+	"strings"
 
 	x402 "github.com/x402-foundation/x402/go/v2"
 	"github.com/x402-foundation/x402/go/v2/mechanisms/hedera"
@@ -33,6 +35,7 @@ func (e *verifyFailure) Error() string {
 type ExactHederaScheme struct {
 	signer          hedera.FacilitatorHederaSigner
 	settlementCache hedera.SettlementTracker
+	pendingStore    x402.PendingSettlementStore
 	aliasPolicy     string
 }
 
@@ -52,7 +55,17 @@ func NewExactHederaScheme(
 	return &ExactHederaScheme{
 		signer:          signer,
 		settlementCache: c,
+		pendingStore:    x402.NewInMemoryPendingSettlementStore(),
 		aliasPolicy:     hedera.AliasPolicyReject,
+	}
+}
+
+// SetPendingSettlementStore overrides the default in-memory PendingSettlementStore
+// used to reconcile a submitted transaction whose outcome is unknown
+// (settlement_pending). A nil store is a no-op.
+func (f *ExactHederaScheme) SetPendingSettlementStore(store x402.PendingSettlementStore) {
+	if store != nil {
+		f.pendingStore = store
 	}
 }
 
@@ -107,28 +120,88 @@ func (f *ExactHederaScheme) Settle(
 	requirements types.PaymentRequirements,
 	fctx *x402.FacilitatorContext,
 ) (*x402.SettleResponse, error) {
+	network := x402.Network(requirements.Network)
+
+	// A prior settle of this exact payload was submitted with an unknown outcome.
+	// Reconcile its receipt instead of re-verifying: verify would reject it as a
+	// replay, and balances may already reflect the transfer. Delete before
+	// reconciling so a concurrent retry falls through to the replay check.
+	txB64, inspected, decodeErr := decodePayloadTransaction(payload)
+	if decodeErr == nil {
+		key := pendingKey(requirements, txB64)
+		if txID, hit, _ := f.pendingStore.Get(ctx, key); hit {
+			_ = f.pendingStore.Delete(ctx, key)
+			return f.reconcilePendingSettlement(ctx, key, txID, payerOf(inspected, requirements.Asset), network)
+		}
+	}
+
 	verifyResp, err := f.Verify(ctx, payload, requirements, fctx)
 	if err != nil {
 		var ve *x402.VerifyError
 		if errors.As(err, &ve) {
-			return nil, x402.NewSettleError(ve.InvalidReason, ve.Payer, x402.Network(requirements.Network), "", ve.InvalidMessage)
+			return nil, x402.NewSettleError(ve.InvalidReason, ve.Payer, network, "", ve.InvalidMessage)
 		}
-		return nil, x402.NewSettleError(ErrVerificationFailed, "", x402.Network(requirements.Network), "", err.Error())
+		return nil, x402.NewSettleError(ErrVerificationFailed, "", network, "", err.Error())
 	}
 	if !verifyResp.IsValid {
-		return nil, x402.NewSettleError(ErrVerificationFailed, verifyResp.Payer, x402.Network(requirements.Network), "", verifyResp.InvalidMessage)
+		return nil, x402.NewSettleError(ErrVerificationFailed, verifyResp.Payer, network, "", verifyResp.InvalidMessage)
 	}
 
-	txID, err := f.settlePayment(ctx, payload, requirements)
+	txID, err := f.settlePayment(ctx, txB64, inspected, requirements)
 	if err != nil {
-		return nil, x402.NewSettleError(ErrTransactionFailed, verifyResp.Payer, x402.Network(requirements.Network), txID, err.Error())
+		return nil, f.settleFailure(ctx, pendingKey(requirements, txB64), txID, verifyResp.Payer, network, err)
 	}
 	return &x402.SettleResponse{
 		Success:     true,
 		Payer:       verifyResp.Payer,
 		Transaction: txID,
-		Network:     x402.Network(requirements.Network),
+		Network:     network,
 	}, nil
+}
+
+func (f *ExactHederaScheme) reconcilePendingSettlement(
+	ctx context.Context,
+	key, txID, payer string,
+	network x402.Network,
+) (*x402.SettleResponse, error) {
+	if err := f.signer.AwaitTransaction(ctx, txID, string(network)); err != nil {
+		return nil, f.settleFailure(ctx, key, txID, payer, network, err)
+	}
+	return &x402.SettleResponse{
+		Success:     true,
+		Payer:       payer,
+		Transaction: txID,
+		Network:     network,
+	}, nil
+}
+
+// settleFailure records an unknown outcome for reconciliation and returns
+// settlement_pending. If the record cannot be stored, a retry could not
+// reconcile, so the failure is reported as terminal with the transaction id.
+func (f *ExactHederaScheme) settleFailure(
+	ctx context.Context,
+	key, txID, payer string,
+	network x402.Network,
+	err error,
+) error {
+	var submitted *hedera.TransactionSubmittedError
+	if txID == "" || !errors.As(err, &submitted) || !submitted.OutcomeUnknown {
+		return x402.NewSettleError(ErrTransactionFailed, payer, network, txID, err.Error())
+	}
+	if setErr := f.pendingStore.Set(ctx, key, txID); setErr != nil {
+		return x402.NewSettleError(ErrTransactionFailed, payer, network, txID,
+			fmt.Sprintf("settlement_pending, but failed to persist for retry: %s", setErr.Error()))
+	}
+	return x402.NewSettleError(x402.ErrSettlementPending, payer, network, txID, err.Error())
+}
+
+// pendingKey binds a pending record to the exact signed payload and the
+// requirements it was verified against, since reconciliation skips verify.
+func pendingKey(requirements types.PaymentRequirements, txB64 string) string {
+	sum := sha256.Sum256([]byte(strings.Join([]string{
+		requirements.Network, requirements.PayTo, requirements.Asset, requirements.Amount, txB64,
+	}, "\x00")))
+	return hex.EncodeToString(sum[:])
 }
 
 func (f *ExactHederaScheme) verifyPayment(
@@ -184,20 +257,7 @@ func (f *ExactHederaScheme) verifyPayment(
 		return "", &verifyFailure{Reason: ErrInvalidPayTo, Message: "invalid payTo"}
 	}
 
-	rawPayload, err := json.Marshal(payload.Payload)
-	if err != nil {
-		return "", &verifyFailure{Reason: ErrTransactionDecode, Message: err.Error()}
-	}
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(rawPayload, &envelope); err != nil {
-		return "", &verifyFailure{Reason: ErrTransactionDecode, Message: err.Error()}
-	}
-	txB64, err := hedera.ExtractTransaction(envelope)
-	if err != nil {
-		return "", &verifyFailure{Reason: ErrTransactionDecode, Message: err.Error()}
-	}
-
-	inspected, err := hedera.InspectTransaction(txB64)
+	txB64, inspected, err := decodePayloadTransaction(payload)
 	if err != nil {
 		return "", &verifyFailure{Reason: ErrTransactionDecode, Message: err.Error()}
 	}
@@ -266,27 +326,36 @@ func (f *ExactHederaScheme) feePayerManaged(ctx context.Context, network, feePay
 	return false
 }
 
-func (f *ExactHederaScheme) settlePayment(
-	ctx context.Context,
-	payload types.PaymentPayload,
-	requirements types.PaymentRequirements,
-) (string, error) {
-	rawPayload, err := json.Marshal(payload.Payload)
+func decodePayloadTransaction(payload types.PaymentPayload) (string, hedera.InspectedTransaction, error) {
+	txB64, err := hedera.ExtractTransaction(payload.Payload)
 	if err != nil {
-		return "", err
-	}
-	var envelope map[string]interface{}
-	if err := json.Unmarshal(rawPayload, &envelope); err != nil {
-		return "", err
-	}
-	txB64, err := hedera.ExtractTransaction(envelope)
-	if err != nil {
-		return "", err
+		return "", hedera.InspectedTransaction{}, err
 	}
 	inspected, err := hedera.InspectTransaction(txB64)
 	if err != nil {
-		return "", err
+		return "", hedera.InspectedTransaction{}, err
 	}
+	return txB64, inspected, nil
+}
+
+// payerOf is a best-effort payer for responses on the reconciliation path.
+func payerOf(inspected hedera.InspectedTransaction, asset string) string {
+	transfers, err := hedera.AssetTransfers(inspected, asset)
+	if err != nil {
+		return ""
+	}
+	if payers := hedera.InferPayers(transfers); len(payers) > 0 {
+		return payers[0].AccountID
+	}
+	return ""
+}
+
+func (f *ExactHederaScheme) settlePayment(
+	ctx context.Context,
+	txB64 string,
+	inspected hedera.InspectedTransaction,
+	requirements types.PaymentRequirements,
+) (string, error) {
 	if f.settlementCache != nil && !f.settlementCache.TryClaim(inspected.TransactionID) {
 		return "", fmt.Errorf("transaction already settled")
 	}
