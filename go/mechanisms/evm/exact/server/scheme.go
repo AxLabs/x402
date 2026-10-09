@@ -42,6 +42,7 @@ func (s *ExactEvmScheme) PaymentFlows() map[string]x402.PaymentFlowConfig {
 	return map[string]x402.PaymentFlowConfig{
 		string(evm.AssetTransferMethodEIP3009): authAndUpfront,
 		string(evm.AssetTransferMethodPermit2): authAndUpfront,
+		string(evm.AssetTransferMethodERC7710): authAndUpfront,
 	}
 }
 

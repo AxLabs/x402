@@ -26,13 +26,25 @@ type ExactEvmSchemeConfig struct {
 	// opt-in: leave it unset on a metered RPC provider, or where invalid payments are common
 	// enough that the wasted calls outweigh the latency win.
 	EnableParallelVerifySimulation bool
+	// ERC7710GasLimit is the explicit simulation and transaction gas limit.
+	// ERC-7710 is disabled when this is zero.
+	ERC7710GasLimit uint64
+	// ERC7710AllowedDelegationManagers is the allowlist of Delegation Manager
+	// addresses the facilitator trusts to execute the requested transfer.
+	// ERC-7710 is disabled when this is empty.
+	ERC7710AllowedDelegationManagers []string
+	// ERC7710AllowInMemoryReplayStore permits process-local replay protection.
+	// Use only for development; production must inject durable shared storage.
+	ERC7710AllowInMemoryReplayStore bool
 }
 
 // ExactEvmScheme implements the SchemeNetworkFacilitator interface for EVM exact payments (V2)
 type ExactEvmScheme struct {
-	signer       evm.FacilitatorEvmSigner
-	config       ExactEvmSchemeConfig
-	pendingStore x402.PendingSettlementStore
+	signer                 evm.FacilitatorEvmSigner
+	config                 ExactEvmSchemeConfig
+	pendingStore           x402.PendingSettlementStore
+	erc7710Store           ERC7710SettlementStore
+	erc7710StoreConfigured bool
 }
 
 // NewExactEvmScheme creates a new ExactEvmScheme
@@ -53,6 +65,7 @@ func NewExactEvmScheme(signer evm.FacilitatorEvmSigner, config *ExactEvmSchemeCo
 		signer:       signer,
 		config:       cfg,
 		pendingStore: x402.NewInMemoryPendingSettlementStore(),
+		erc7710Store: NewInMemoryERC7710SettlementStore(),
 	}
 }
 
@@ -65,6 +78,15 @@ func NewExactEvmScheme(signer evm.FacilitatorEvmSigner, config *ExactEvmSchemeCo
 func (f *ExactEvmScheme) SetPendingSettlementStore(store x402.PendingSettlementStore) {
 	if store != nil {
 		f.pendingStore = store
+	}
+}
+
+// SetERC7710SettlementStore overrides the default in-memory replay store.
+// Multi-instance facilitators must inject a shared implementation.
+func (f *ExactEvmScheme) SetERC7710SettlementStore(store ERC7710SettlementStore) {
+	if store != nil {
+		f.erc7710Store = store
+		f.erc7710StoreConfigured = true
 	}
 }
 
@@ -91,13 +113,21 @@ func (f *ExactEvmScheme) GetSigners(_ x402.Network) []string {
 }
 
 // Verify verifies a V2 payment payload against requirements.
-// Routes to EIP-3009 or Permit2 verification based on payload type.
+// Routes to ERC-7710, Permit2, or EIP-3009 verification.
 func (f *ExactEvmScheme) Verify(
 	ctx context.Context,
 	payload types.PaymentPayload,
 	requirements types.PaymentRequirements,
 	fctx *x402.FacilitatorContext,
 ) (*x402.VerifyResponse, error) {
+	if evm.HasERC7710PayloadFields(payload.Payload) || requestsERC7710(payload.Accepted, requirements) {
+		erc7710Payload, err := evm.ERC7710PayloadFromMap(payload.Payload)
+		if err != nil {
+			return nil, x402.NewVerifyError(ErrInvalidPayload, "", fmt.Sprintf("failed to parse ERC-7710 payload: %s", err.Error()))
+		}
+		return f.verifyERC7710(ctx, payload, requirements, erc7710Payload, fctx, true)
+	}
+
 	isPermit2 := evm.IsPermit2Payload(payload.Payload)
 
 	if isPermit2 {
@@ -115,13 +145,22 @@ func (f *ExactEvmScheme) Verify(
 }
 
 // Settle settles a V2 payment on-chain.
-// Routes to EIP-3009 or Permit2 settlement based on payload type.
+// Routes to ERC-7710, Permit2, or EIP-3009 settlement.
 func (f *ExactEvmScheme) Settle(
 	ctx context.Context,
 	payload types.PaymentPayload,
 	requirements types.PaymentRequirements,
 	fctx *x402.FacilitatorContext,
 ) (*x402.SettleResponse, error) {
+	if evm.HasERC7710PayloadFields(payload.Payload) || requestsERC7710(payload.Accepted, requirements) {
+		erc7710Payload, err := evm.ERC7710PayloadFromMap(payload.Payload)
+		if err != nil {
+			network := x402.Network(payload.Accepted.Network)
+			return nil, x402.NewSettleError(ErrInvalidPayload, "", network, "", fmt.Sprintf("failed to parse ERC-7710 payload: %s", err.Error()))
+		}
+		return f.settleERC7710(ctx, payload, requirements, erc7710Payload, fctx)
+	}
+
 	isPermit2 := evm.IsPermit2Payload(payload.Payload)
 
 	if isPermit2 {
@@ -138,4 +177,20 @@ func (f *ExactEvmScheme) Settle(
 	}
 
 	return f.settleEIP3009(ctx, payload, requirements, fctx)
+}
+
+func requestsERC7710(accepted, requirements types.PaymentRequirements) bool {
+	return assetTransferMethod(accepted) == evm.AssetTransferMethodERC7710 ||
+		assetTransferMethod(requirements) == evm.AssetTransferMethodERC7710
+}
+
+func assetTransferMethod(requirements types.PaymentRequirements) evm.AssetTransferMethod {
+	if requirements.Extra == nil {
+		return evm.AssetTransferMethodEIP3009
+	}
+	method, ok := requirements.Extra["assetTransferMethod"].(string)
+	if !ok {
+		return evm.AssetTransferMethodEIP3009
+	}
+	return evm.AssetTransferMethod(method)
 }

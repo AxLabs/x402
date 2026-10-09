@@ -4,6 +4,7 @@ import "github.com/x402-foundation/x402/go/v2/mechanisms/evm"
 
 // Facilitator error constants for the exact EVM scheme
 const (
+	ErrERC7710PaymentIdentifierConflict = "payment_identifier_conflict"
 	// EIP-3009 Verify errors
 	ErrInvalidScheme               = "invalid_exact_evm_scheme"
 	ErrNetworkMismatch             = "invalid_exact_evm_network_mismatch"
@@ -47,6 +48,22 @@ const (
 	ErrSmartWalletDeploymentFailed = "smart_wallet_deployment_failed"
 	ErrFactoryNotAllowed           = "eip6492_factory_not_allowed"
 	ErrUnsupportedPayloadType      = "unsupported_payload_type"
+
+	// ERC-7710 errors
+	ErrERC7710InvalidMethod               = "invalid_exact_evm_erc7710_asset_transfer_method"
+	ErrERC7710AcceptedMismatch            = "invalid_exact_evm_erc7710_accepted_mismatch"
+	ErrERC7710InvalidAddress              = "invalid_exact_evm_erc7710_address"
+	ErrERC7710InvalidAmount               = "invalid_exact_evm_erc7710_amount"
+	ErrERC7710GasLimitRequired            = "unsupported_exact_evm_erc7710_gas_limit_required"
+	ErrERC7710ReplayStoreRequired         = "unsupported_exact_evm_erc7710_replay_store_required"
+	ErrERC7710SignerUnsupported           = "unsupported_exact_evm_erc7710_signer"
+	ErrERC7710CalldataExceedsGasLimit     = "invalid_exact_evm_erc7710_calldata_exceeds_gas_limit"
+	ErrERC7710DelegationManagerNotAllowed = "unsupported_exact_evm_erc7710_delegation_manager"
+	ErrERC7710DelegationManagerNotFound   = "invalid_exact_evm_erc7710_delegation_manager_not_deployed"
+	ErrERC7710DelegatorNotDeployed        = "invalid_exact_evm_erc7710_delegator_not_deployed"
+	ErrERC7710SimulationFailed            = "invalid_exact_evm_erc7710_simulation_failed"
+	ErrERC7710SettlementFailed            = "invalid_exact_evm_erc7710_settlement_failed"
+	ErrERC7710TransferEventMismatch       = "invalid_exact_evm_erc7710_transfer_event_mismatch"
 
 	// Permit2 verify errors — canonical values live in evm.ErrPermit2*
 	ErrPermit2InvalidSpender    = evm.ErrPermit2InvalidSpender
