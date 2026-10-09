@@ -198,7 +198,7 @@ func nodeAccountIDFromSigned(tx *services.Transaction) (hiero.AccountID, error) 
 }
 
 func (s *PrivateKeyFacilitatorSigner) submitSignedTransfers(ctx context.Context, network string, txs []*services.Transaction) error {
-	sdkClient, err := newSDKClient(network)
+	sdkClient, err := s.sdkClient(network)
 	if err != nil {
 		return err
 	}

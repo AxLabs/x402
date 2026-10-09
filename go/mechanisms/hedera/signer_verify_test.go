@@ -10,12 +10,18 @@ import (
 	"testing"
 
 	hiero "github.com/hiero-ledger/hiero-sdk-go/v2/sdk"
+	"github.com/x402-foundation/x402/go/v2/types"
 )
 
 func createSignedHbarTransfer(t *testing.T, keys ...hiero.PrivateKey) string {
 	t.Helper()
 	client := hiero.ClientForTestnet()
 	defer client.Close()
+	return signHbarTransferWith(t, client, keys...)
+}
+
+func signHbarTransferWith(t *testing.T, client *hiero.Client, keys ...hiero.PrivateKey) string {
+	t.Helper()
 	feePayer, _ := hiero.AccountIDFromString("0.0.5001")
 	payer, _ := hiero.AccountIDFromString("0.0.9001")
 	payTo, _ := hiero.AccountIDFromString("0.0.7001")
@@ -35,6 +41,89 @@ func createSignedHbarTransfer(t *testing.T, keys ...hiero.PrivateKey) string {
 		t.Fatal(err)
 	}
 	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestClientSignerTransactionInspects(t *testing.T) {
+	key, err := hiero.PrivateKeyGenerateEcdsa()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := NewPrivateKeyClientSigner("0.0.9001", key.StringRaw(), HederaTestnetCAIP2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signer.AccountID() != "0.0.9001" {
+		t.Fatalf("account=%s", signer.AccountID())
+	}
+
+	for _, asset := range []string{HBARAssetID, HederaTestnetUSDC} {
+		t.Run(asset, func(t *testing.T) {
+			txB64, err := signer.CreatePartiallySignedTransferTransaction(context.Background(), types.PaymentRequirements{
+				Network: HederaTestnetCAIP2,
+				Asset:   asset,
+				Amount:  "100",
+				PayTo:   "0.0.7001",
+				Extra:   map[string]interface{}{"feePayer": "0.0.5001"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			inspected, err := InspectTransaction(txB64)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if inspected.TransactionType != "TransferTransaction" || inspected.HasNonTransferOps || inspected.TransactionIDAccount != "0.0.5001" {
+				t.Fatalf("inspected=%+v", inspected)
+			}
+			transfers, err := AssetTransfers(inspected, asset)
+			if err != nil {
+				t.Fatal(err)
+			}
+			payers := InferPayers(transfers)
+			if len(payers) != 1 || payers[0].AccountID != "0.0.9001" || payers[0].Amount != "100" {
+				t.Fatalf("payers=%+v", payers)
+			}
+			if receivers := GetPositiveReceivers(transfers); len(receivers) != 1 || receivers[0] != "0.0.7001" {
+				t.Fatalf("receivers=%v", receivers)
+			}
+			other := HederaTestnetUSDC
+			if asset == HederaTestnetUSDC {
+				other = HBARAssetID
+			}
+			if _, err := AssetTransfers(inspected, other); err == nil {
+				t.Fatalf("transfers of %s must not match requirements for %s", asset, other)
+			}
+
+			raw, _ := base64.StdEncoding.DecodeString(txB64)
+			tx, err := hiero.TransactionFromBytes(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pub := key.PublicKey()
+			if !keySignsTransaction(pub, tx) || !keySignsTransaction(&pub, tx) {
+				t.Fatal("payer key must sign the transaction")
+			}
+			if keySignsTransaction((*hiero.PublicKey)(nil), tx) || keySignsTransaction((*hiero.KeyList)(nil), tx) {
+				t.Fatal("nil keys must not verify")
+			}
+		})
+	}
+
+	for name, requirements := range map[string]types.PaymentRequirements{
+		"missing_fee_payer": {Network: HederaTestnetCAIP2, Asset: HBARAssetID, Amount: "1", PayTo: "0.0.7001"},
+		"amount_overflow": {
+			Network: HederaTestnetCAIP2, Asset: HBARAssetID, Amount: "9223372036854775808", PayTo: "0.0.7001",
+			Extra: map[string]interface{}{"feePayer": "0.0.5001"},
+		},
+		"unsupported_network": {
+			Network: "hedera:previewnet", Asset: HBARAssetID, Amount: "1", PayTo: "0.0.7001",
+			Extra: map[string]interface{}{"feePayer": "0.0.5001"},
+		},
+	} {
+		if _, err := signer.CreatePartiallySignedTransferTransaction(context.Background(), requirements); err == nil {
+			t.Fatalf("%s: expected error", name)
+		}
+	}
 }
 
 func TestNewPrivateKeyFacilitatorSigner(t *testing.T) {

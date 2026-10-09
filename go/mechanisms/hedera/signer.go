@@ -20,6 +20,14 @@ type PrivateKeyFacilitatorSigner struct {
 	operators     []operatorKey
 	mirrorNodeURL string
 	http          *mirrorHTTP
+	newClient     func(network string) (*hiero.Client, error)
+}
+
+func (s *PrivateKeyFacilitatorSigner) sdkClient(network string) (*hiero.Client, error) {
+	if s.newClient != nil {
+		return s.newClient(network)
+	}
+	return newSDKClient(network)
 }
 
 // NewPrivateKeyFacilitatorSigner builds a facilitator signer from operator credentials.
@@ -242,7 +250,7 @@ func (s *PrivateKeyFacilitatorSigner) waitSuccess(
 	op operatorKey,
 	txID hiero.TransactionID,
 ) error {
-	sdkClient, err := newSDKClient(network)
+	sdkClient, err := s.sdkClient(network)
 	if err != nil {
 		return err
 	}

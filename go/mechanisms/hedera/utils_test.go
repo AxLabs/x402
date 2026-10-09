@@ -3,6 +3,8 @@ package hedera
 import (
 	"math/big"
 	"testing"
+
+	hiero "github.com/hiero-ledger/hiero-sdk-go/v2/sdk"
 )
 
 func TestIsValidEntityAndAsset(t *testing.T) {
@@ -177,5 +179,17 @@ func TestParsePrivateKeyECDSAPreferred(t *testing.T) {
 	// ECDSA secp256k1 compressed pubkeys are 33 bytes; ED25519 are 32.
 	if len(key.PublicKey().BytesRaw()) != 33 {
 		t.Fatalf("expected ECDSA pubkey (33 bytes), got %d", len(key.PublicKey().BytesRaw()))
+	}
+
+	ed, err := hiero.PrivateKeyGenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParsePrivateKey(ed.String())
+	if err != nil || parsed.PublicKey().String() != ed.PublicKey().String() {
+		t.Fatalf("DER ED25519 key must keep its type: err=%v", err)
+	}
+	if _, err := ParsePrivateKey("not-a-key"); err == nil {
+		t.Fatal("expected unsupported encoding error")
 	}
 }

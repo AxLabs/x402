@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
+	"time"
 
 	sdkproto "github.com/hiero-ledger/hiero-sdk-go/v2/proto/sdk"
 	"github.com/hiero-ledger/hiero-sdk-go/v2/proto/services"
@@ -313,6 +315,173 @@ func TestAwaitTransactionRejectsInvalidInputs(t *testing.T) {
 	err = signer.AwaitTransaction(ctx, "0.0.5002@1700000001.000000000", HederaTestnetCAIP2)
 	if err == nil || err.Error() != "fee_payer_not_managed_by_facilitator" {
 		t.Fatalf("expected unmanaged operator error, got %v", err)
+	}
+}
+
+type fakeConsensusNode struct {
+	services.UnimplementedCryptoServiceServer
+	precheck      services.ResponseCodeEnum
+	receiptStatus services.ResponseCodeEnum
+
+	mu        sync.Mutex
+	submitted []*services.Transaction
+}
+
+func (n *fakeConsensusNode) CryptoTransfer(_ context.Context, tx *services.Transaction) (*services.TransactionResponse, error) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.submitted = append(n.submitted, tx)
+	return &services.TransactionResponse{NodeTransactionPrecheckCode: n.precheck}, nil
+}
+
+func (n *fakeConsensusNode) GetTransactionReceipts(context.Context, *services.Query) (*services.Response, error) {
+	return &services.Response{Response: &services.Response_TransactionGetReceipt{
+		TransactionGetReceipt: &services.TransactionGetReceiptResponse{
+			Header:  &services.ResponseHeader{NodeTransactionPrecheckCode: services.ResponseCodeEnum_OK},
+			Receipt: &services.TransactionReceipt{Status: n.receiptStatus},
+		},
+	}}, nil
+}
+
+func (n *fakeConsensusNode) submissions() []*services.Transaction {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]*services.Transaction(nil), n.submitted...)
+}
+
+// fakeNodeNetwork serves node as consensus node 0.0.3 on a plaintext local port.
+func fakeNodeNetwork(t *testing.T, node *fakeConsensusNode) map[string]hiero.AccountID {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	services.RegisterCryptoServiceServer(server, node)
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(server.Stop)
+	return map[string]hiero.AccountID{listener.Addr().String(): {Account: 3}}
+}
+
+func fakeNodeSigner(t *testing.T, network map[string]hiero.AccountID) (*PrivateKeyFacilitatorSigner, hiero.PrivateKey) {
+	t.Helper()
+	key, err := hiero.PrivateKeyGenerateEcdsa()
+	if err != nil {
+		t.Fatal(err)
+	}
+	operatorID, _ := hiero.AccountIDFromString("0.0.5001")
+	return &PrivateKeyFacilitatorSigner{
+		operators: []operatorKey{{id: operatorID, key: key}},
+		http:      newMirrorHTTP(),
+		newClient: func(string) (*hiero.Client, error) { return hiero.ClientForNetwork(network), nil },
+	}, key
+}
+
+func payerSignedTransfer(t *testing.T, network map[string]hiero.AccountID) (string, string) {
+	t.Helper()
+	payerKey, err := hiero.PrivateKeyGenerateEd25519()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := hiero.ClientForNetwork(network)
+	defer client.Close()
+	txB64 := signHbarTransferWith(t, client, payerKey)
+	inspected, err := InspectTransaction(txB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return txB64, inspected.TransactionID
+}
+
+func TestSignAndSubmitTransactionSettles(t *testing.T) {
+	node := &fakeConsensusNode{receiptStatus: services.ResponseCodeEnum_SUCCESS}
+	network := fakeNodeNetwork(t, node)
+	signer, operatorKey := fakeNodeSigner(t, network)
+	txB64, wantID := payerSignedTransfer(t, network)
+
+	txID, err := signer.SignAndSubmitTransaction(context.Background(), txB64, "0.0.5001", HederaTestnetCAIP2)
+	if err != nil || txID != wantID {
+		t.Fatalf("txID=%s want %s err=%v", txID, wantID, err)
+	}
+	submitted := node.submissions()
+	if len(submitted) != 1 {
+		t.Fatalf("submissions=%d, want 1", len(submitted))
+	}
+	signed := &services.SignedTransaction{}
+	if err := proto.Unmarshal(submitted[0].GetSignedTransactionBytes(), signed); err != nil {
+		t.Fatal(err)
+	}
+	if !signatureMapHasKey(signed.GetSigMap(), operatorKey.PublicKey().BytesRaw()) || len(signed.GetSigMap().GetSigPair()) != 2 {
+		t.Fatalf("expected payer and fee payer signatures, got %d pairs", len(signed.GetSigMap().GetSigPair()))
+	}
+	if err := signer.AwaitTransaction(context.Background(), txID, HederaTestnetCAIP2); err != nil {
+		t.Fatalf("AwaitTransaction: %v", err)
+	}
+}
+
+func TestSignAndSubmitTransactionOutcomes(t *testing.T) {
+	tests := []struct {
+		name          string
+		precheck      services.ResponseCodeEnum
+		receiptStatus services.ResponseCodeEnum
+		timeout       time.Duration
+		wantSubmitted bool
+		wantUnknown   bool
+	}{
+		{name: "precheck_rejected", precheck: services.ResponseCodeEnum_INVALID_SIGNATURE},
+		{name: "receipt_failed", receiptStatus: services.ResponseCodeEnum_INSUFFICIENT_ACCOUNT_BALANCE, wantSubmitted: true},
+		{name: "receipt_pending", receiptStatus: services.ResponseCodeEnum_UNKNOWN, timeout: 500 * time.Millisecond, wantSubmitted: true, wantUnknown: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			network := fakeNodeNetwork(t, &fakeConsensusNode{precheck: tt.precheck, receiptStatus: tt.receiptStatus})
+			signer, _ := fakeNodeSigner(t, network)
+			txB64, wantID := payerSignedTransfer(t, network)
+			ctx := context.Background()
+			if tt.timeout > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, tt.timeout)
+				defer cancel()
+			}
+
+			txID, err := signer.SignAndSubmitTransaction(ctx, txB64, "0.0.5001", HederaTestnetCAIP2)
+			var submitted *TransactionSubmittedError
+			if !tt.wantSubmitted {
+				if err == nil || errors.As(err, &submitted) || txID != "" {
+					t.Fatalf("expected pre-consensus rejection, got txID=%q err=%v", txID, err)
+				}
+				return
+			}
+			if !errors.As(err, &submitted) || txID != wantID || submitted.TransactionID != wantID {
+				t.Fatalf("txID=%q err=%v", txID, err)
+			}
+			if submitted.OutcomeUnknown != tt.wantUnknown {
+				t.Fatalf("OutcomeUnknown=%v, want %v", submitted.OutcomeUnknown, tt.wantUnknown)
+			}
+			err = signer.AwaitTransaction(ctx, txID, HederaTestnetCAIP2)
+			if !errors.As(err, &submitted) || submitted.OutcomeUnknown != tt.wantUnknown {
+				t.Fatalf("AwaitTransaction err=%v", err)
+			}
+		})
+	}
+}
+
+func TestSignAndSubmitTransactionUnreachableNodeIsAmbiguous(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	network := map[string]hiero.AccountID{listener.Addr().String(): {Account: 3}}
+	_ = listener.Close()
+	signer, _ := fakeNodeSigner(t, network)
+	txB64, wantID := payerSignedTransfer(t, network)
+
+	txID, err := signer.SignAndSubmitTransaction(context.Background(), txB64, "0.0.5001", HederaTestnetCAIP2)
+	var submitted *TransactionSubmittedError
+	if !errors.As(err, &submitted) || !submitted.OutcomeUnknown || txID != wantID {
+		t.Fatalf("expected ambiguous submission, got txID=%q err=%v", txID, err)
 	}
 }
 
