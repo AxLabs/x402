@@ -60,6 +60,16 @@ scheme := hederafacil.NewExactHederaScheme(facSigner)
 
 5. **Settlement cache / HA** — the default `SettlementCache` is process-local with `SettlementTTL` expiry. Multi-replica facilitators must inject a shared `SettlementTracker` (or run a single settler); otherwise the same transaction ID can be settled twice.
 
+6. **Asset transfer methods** — only `cryptoTransfer` (the default) is implemented. Requirements with `extra.assetTransferMethod` set to `transferExecutor` are rejected with `invalid_exact_hedera_unsupported_asset_transfer_method`, and unknown values with `invalid_exact_hedera_asset_transfer_method`.
+
+7. **Pending settlements** — when submission or the receipt lookup fails without a definitive status, `Settle` returns `settlement_pending` with the transaction id; a retry of the same payload re-queries the receipt instead of resubmitting. The default store is process-local; multi-replica facilitators should share one via `SetPendingSettlementStore`.
+
+## Testnet setup
+
+1. Create ECDSA testnet accounts for the client, resource server (`payTo`), and facilitator (fee payer) in the [Hedera Portal](https://portal.hedera.com/) and fund them with testnet HBAR from the [Hedera faucet](https://portal.hedera.com/faucet).
+2. For HTS payments (e.g. testnet USDC `0.0.429274`), associate the token with both the payer and `payTo` accounts, or give them free auto-association slots. Verification fails with `invalid_exact_hedera_payload_preflight_failed` otherwise.
+3. HBAR payments (`asset` `0.0.0`) need no association; amounts are in tinybars.
+
 ## Supported networks
 
 - `hedera:mainnet` — USDC `0.0.456858`

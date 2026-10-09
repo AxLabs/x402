@@ -119,6 +119,54 @@ func TestParseAmount(t *testing.T) {
 	}
 }
 
+func TestDefaultAssets(t *testing.T) {
+	asset, err := GetDefaultAsset(HederaTestnetCAIP2, "")
+	if err != nil || asset.Asset != HederaTestnetUSDC || asset.Decimals != HederaUSDCDecimals {
+		t.Fatalf("default asset=%+v err=%v", asset, err)
+	}
+	asset, err = GetDefaultAsset(HederaMainnetCAIP2, "usdc")
+	if err != nil || asset.Asset != HederaMainnetUSDC {
+		t.Fatalf("symbol lookup asset=%+v err=%v", asset, err)
+	}
+	if _, err := GetDefaultAsset(HederaTestnetCAIP2, "PYUSD"); err == nil {
+		t.Fatal("expected error for unknown symbol")
+	}
+	if _, err := GetDefaultAsset("hedera:previewnet", ""); err == nil {
+		t.Fatal("expected error for network without default asset")
+	}
+	if found := FindDefaultAsset(HederaTestnetUSDC, HederaTestnetCAIP2); found == nil || found.Symbol != "USDC" {
+		t.Fatalf("reverse lookup=%+v", found)
+	}
+	if FindDefaultAsset(HederaTestnetUSDC, HederaMainnetCAIP2) != nil {
+		t.Fatal("testnet USDC must not resolve on mainnet")
+	}
+	if FindDefaultAsset(HBARAssetID, HederaTestnetCAIP2) != nil {
+		t.Fatal("HBAR is not a default asset")
+	}
+}
+
+func TestAssetTransferMethod(t *testing.T) {
+	tests := []struct {
+		name   string
+		extra  map[string]interface{}
+		method string
+		ok     bool
+	}{
+		{"nil extra", nil, AssetTransferMethodCryptoTransfer, true},
+		{"absent", map[string]interface{}{"feePayer": "0.0.1"}, AssetTransferMethodCryptoTransfer, true},
+		{"explicit", map[string]interface{}{"assetTransferMethod": AssetTransferMethodTransferExecutor}, AssetTransferMethodTransferExecutor, true},
+		{"non-string", map[string]interface{}{"assetTransferMethod": 1}, "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			method, ok := AssetTransferMethod(tt.extra)
+			if method != tt.method || ok != tt.ok {
+				t.Fatalf("got (%q, %v), want (%q, %v)", method, ok, tt.method, tt.ok)
+			}
+		})
+	}
+}
+
 func TestParsePrivateKeyECDSAPreferred(t *testing.T) {
 	// 32-byte hex must parse as ECDSA (not ED25519 default).
 	hexKey := "a869f4c6191b9c8c99933e7f6b6611711737e4b1a1a5a4cb5370e719a1f6df98"

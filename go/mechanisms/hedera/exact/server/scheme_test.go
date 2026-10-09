@@ -25,6 +25,39 @@ func TestParsePriceAssetAmount(t *testing.T) {
 	}
 }
 
+func TestPaymentFlowsResolveWithoutWireAssetTransferMethod(t *testing.T) {
+	s := server.NewExactHederaScheme()
+	if s.Scheme() != hedera.SchemeExact {
+		t.Fatalf("scheme=%s", s.Scheme())
+	}
+	for _, flow := range []x402.PaymentFlowName{"", x402.PaymentFlowUpfront} {
+		extra := map[string]interface{}{"feePayer": "0.0.5555"}
+		if flow != "" {
+			extra["paymentFlow"] = string(flow)
+		}
+		atm, resolved, err := x402.ResolvePaymentFlow(s, types.PaymentRequirements{Extra: extra})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := flow
+		if want == "" {
+			want = x402.PaymentFlowAuthorization
+		}
+		if resolved != want {
+			t.Fatalf("flow=%s want %s", resolved, want)
+		}
+		wire := x402.ApplyPaymentFlowWireExtra(extra, atm, resolved)
+		if _, present := wire["assetTransferMethod"]; present {
+			t.Fatalf("default cryptoTransfer must not be emitted: %+v", wire)
+		}
+	}
+	if _, _, err := x402.ResolvePaymentFlow(s, types.PaymentRequirements{
+		Extra: map[string]interface{}{"paymentFlow": string(x402.PaymentFlowEscrow)},
+	}); err == nil {
+		t.Fatal("expected escrow flow to be unsupported")
+	}
+}
+
 func TestParsePriceMoneyDefaultUSDC(t *testing.T) {
 	s := server.NewExactHederaScheme()
 	for _, price := range []x402.Price{float64(0.10), "$0.10"} {
