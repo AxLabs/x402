@@ -136,16 +136,70 @@ func (s *PrivateKeyFacilitatorSigner) AwaitTransaction(ctx context.Context, tran
 	if err != nil {
 		return err
 	}
+	if result, err := s.mirrorTransactionResult(ctx, network, txID); err == nil && result != "" {
+		if result != "SUCCESS" {
+			return receiptError(transactionID, &mirrorFailureError{result: result})
+		}
+		return nil
+	}
 	if err := s.waitSuccess(ctx, network, *op, txID); err != nil {
 		return receiptError(transactionID, err)
 	}
 	return nil
 }
 
-// receiptError treats only a definitive non-success receipt status as terminal.
+type mirrorTransactionsResponse struct {
+	Transactions []struct {
+		Result    string `json:"result"`
+		Nonce     int    `json:"nonce"`
+		Scheduled bool   `json:"scheduled"`
+	} `json:"transactions"`
+}
+
+// mirrorFailureError is a definitive non-success consensus result read from the Mirror Node.
+type mirrorFailureError struct {
+	result string
+}
+
+func (e *mirrorFailureError) Error() string {
+	return "transaction reached consensus with status " + e.result
+}
+
+// mirrorTransactionResult reads the consensus result of txID from the Mirror Node, which
+// retains it after consensus nodes drop receipts (about 3 minutes). It returns "" when the
+// Mirror Node has no record of the submitted transaction yet.
+func (s *PrivateKeyFacilitatorSigner) mirrorTransactionResult(ctx context.Context, network string, txID hiero.TransactionID) (string, error) {
+	base, err := mirrorURLForNetwork(network, s.mirrorNodeURL)
+	if err != nil {
+		return "", err
+	}
+	if txID.AccountID == nil || txID.ValidStart == nil {
+		return "", fmt.Errorf("incomplete transaction id")
+	}
+	id := fmt.Sprintf("%s-%d-%09d", txID.AccountID.String(), txID.ValidStart.Unix(), txID.ValidStart.Nanosecond())
+	var resp mirrorTransactionsResponse
+	if err := s.http.getJSON(ctx, base+"/api/v1/transactions/"+id, &resp); err != nil {
+		return "", err
+	}
+	result := ""
+	for _, tx := range resp.Transactions {
+		// Child, scheduled, and duplicate records do not describe the submitted transaction.
+		if tx.Nonce != 0 || tx.Scheduled || tx.Result == "" || tx.Result == "DUPLICATE_TRANSACTION" {
+			continue
+		}
+		if tx.Result == "SUCCESS" {
+			return tx.Result, nil
+		}
+		result = tx.Result
+	}
+	return result, nil
+}
+
+// receiptError treats only a definitive non-success consensus status as terminal.
 func receiptError(transactionID string, err error) *TransactionSubmittedError {
 	var status hiero.ErrHederaReceiptStatus
-	terminal := errors.As(err, &status) && status.Status != hiero.StatusUnknown
+	var mirrorFailure *mirrorFailureError
+	terminal := (errors.As(err, &status) && status.Status != hiero.StatusUnknown) || errors.As(err, &mirrorFailure)
 	return &TransactionSubmittedError{
 		TransactionID:  transactionID,
 		OutcomeUnknown: !terminal,

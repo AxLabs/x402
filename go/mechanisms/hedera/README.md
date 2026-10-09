@@ -62,7 +62,7 @@ scheme := hederafacil.NewExactHederaScheme(facSigner)
 
 6. **Asset transfer methods** — only `cryptoTransfer` (the default) is implemented. Requirements with `extra.assetTransferMethod` set to `transferExecutor` are rejected with `invalid_exact_hedera_unsupported_asset_transfer_method`, and unknown values with `invalid_exact_hedera_asset_transfer_method`.
 
-7. **Pending settlements** — when submission or the receipt lookup fails without a definitive status, `Settle` returns `settlement_pending` with the transaction id; a retry of the same payload re-queries the receipt instead of resubmitting. The default store is process-local; multi-replica facilitators should share one via `SetPendingSettlementStore`.
+7. **Pending settlements** — when submission or the receipt lookup fails without a definitive status, `Settle` returns `settlement_pending` with the transaction id; a retry of the same payload looks up the consensus result instead of resubmitting: first on the Mirror Node, which keeps it after consensus nodes drop receipts (about 3 minutes), then via a receipt query. The default store is process-local; multi-replica facilitators should share one via `SetPendingSettlementStore`.
 
 ## Testnet setup
 

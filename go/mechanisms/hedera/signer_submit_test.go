@@ -372,10 +372,13 @@ func fakeNodeSigner(t *testing.T, network map[string]hiero.AccountID) (*PrivateK
 		t.Fatal(err)
 	}
 	operatorID, _ := hiero.AccountIDFromString("0.0.5001")
+	mirror := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(mirror.Close)
 	return &PrivateKeyFacilitatorSigner{
-		operators: []operatorKey{{id: operatorID, key: key}},
-		http:      newMirrorHTTP(),
-		newClient: func(string) (*hiero.Client, error) { return hiero.ClientForNetwork(network), nil },
+		operators:     []operatorKey{{id: operatorID, key: key}},
+		mirrorNodeURL: mirror.URL,
+		http:          &mirrorHTTP{client: mirror.Client()},
+		newClient:     func(string) (*hiero.Client, error) { return hiero.ClientForNetwork(network), nil },
 	}, key
 }
 
@@ -463,6 +466,91 @@ func TestSignAndSubmitTransactionOutcomes(t *testing.T) {
 			err = signer.AwaitTransaction(ctx, txID, HederaTestnetCAIP2)
 			if !errors.As(err, &submitted) || submitted.OutcomeUnknown != tt.wantUnknown {
 				t.Fatalf("AwaitTransaction err=%v", err)
+			}
+		})
+	}
+}
+
+func TestAwaitTransactionPrefersMirrorConsensusResult(t *testing.T) {
+	const txID = "0.0.5001@1700000001.000000042"
+	tests := []struct {
+		name          string
+		mirrorStatus  int
+		results       []map[string]interface{}
+		receiptStatus services.ResponseCodeEnum
+		wantErr       bool
+		wantUnknown   bool
+	}{
+		{
+			name:          "mirror_success_after_receipt_expired",
+			mirrorStatus:  http.StatusOK,
+			results:       []map[string]interface{}{{"result": "SUCCESS", "nonce": 0, "scheduled": false}},
+			receiptStatus: services.ResponseCodeEnum_RECEIPT_NOT_FOUND,
+		},
+		{
+			name:         "mirror_failure_is_terminal",
+			mirrorStatus: http.StatusOK,
+			results: []map[string]interface{}{
+				{"result": "DUPLICATE_TRANSACTION", "nonce": 0, "scheduled": false},
+				{"result": "INSUFFICIENT_ACCOUNT_BALANCE", "nonce": 0, "scheduled": false},
+			},
+			receiptStatus: services.ResponseCodeEnum_SUCCESS,
+			wantErr:       true,
+		},
+		{
+			name:          "mirror_not_indexed_uses_receipt",
+			mirrorStatus:  http.StatusNotFound,
+			receiptStatus: services.ResponseCodeEnum_SUCCESS,
+		},
+		{
+			name:         "only_duplicate_and_child_records_use_receipt",
+			mirrorStatus: http.StatusOK,
+			results: []map[string]interface{}{
+				{"result": "DUPLICATE_TRANSACTION", "nonce": 0, "scheduled": false},
+				{"result": "SUCCESS", "nonce": 1, "scheduled": false},
+			},
+			receiptStatus: services.ResponseCodeEnum_INSUFFICIENT_ACCOUNT_BALANCE,
+			wantErr:       true,
+		},
+		{
+			name:          "mirror_unavailable_uses_receipt",
+			mirrorStatus:  http.StatusServiceUnavailable,
+			receiptStatus: services.ResponseCodeEnum_SUCCESS,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var requested string
+			mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requested = r.URL.Path
+				w.WriteHeader(tt.mirrorStatus)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"transactions": tt.results})
+			}))
+			defer mirror.Close()
+			signer, _ := fakeNodeSigner(t, fakeNodeNetwork(t, &fakeConsensusNode{receiptStatus: tt.receiptStatus}))
+			signer.mirrorNodeURL = mirror.URL
+			signer.http = &mirrorHTTP{client: mirror.Client()}
+
+			ctx := context.Background()
+			if tt.receiptStatus == services.ResponseCodeEnum_RECEIPT_NOT_FOUND {
+				// A receipt query would retry indefinitely; only the mirror result can resolve this.
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, 2*time.Second)
+				defer cancel()
+			}
+			err := signer.AwaitTransaction(ctx, txID, HederaTestnetCAIP2)
+			if requested != "/api/v1/transactions/0.0.5001-1700000001-000000042" {
+				t.Fatalf("mirror path=%q", requested)
+			}
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("AwaitTransaction: %v", err)
+				}
+				return
+			}
+			var submitted *TransactionSubmittedError
+			if !errors.As(err, &submitted) || submitted.OutcomeUnknown != tt.wantUnknown || submitted.TransactionID != txID {
+				t.Fatalf("err=%v", err)
 			}
 		})
 	}
